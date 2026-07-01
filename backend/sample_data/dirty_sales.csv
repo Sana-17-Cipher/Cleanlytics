@@ -1,0 +1,9 @@
+TransactionID,Date,ProductName,Category,Price,Quantity,CustomerEmail,CustomerPhone
+1,2023-01-01,Widget A,Electronics,25.50,2,john.doe@email.com,555-0100
+2,01/02/2023, widget B ,Electronics,  30.00,1,jane.smith@email,555-0101
+3,2023-01-03,Widget A,Electronics,25.50,2,john.doe@email.com,555-0100
+4,2023-01-04,Super Gadget,Gadgets,150.00,-5,bob@domain.com,555-0102
+5,2023-01-05,,Accessories,15.99,10,,
+6,2023-01-06,Mega Widget, Electronics,10000.00,1,alice@email.com,555-0104
+7,Jan 7 2023,Widget C,Accessories,12.50,5,invalid-email,555-abc
+8,2023-01-08,Widget A,Electronics,,2,john.doe@email.com,555-0100

@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pandas
+numpy
+scipy
+python-multipart
+openpyxl
+pydantic
+sqlalchemy
+psycopg2-binary
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-jose[cryptography]
+python-dotenv
