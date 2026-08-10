@@ -41,7 +41,7 @@ export function splitColumn(
     
     const splitObj: Record<string, any> = {};
     finalTargetColumns.forEach((colName, index) => {
-      let partVal = parts[index];
+      let partVal: any = parts[index];
       if (partVal === undefined || partVal === '') {
         partVal = null;
       }
@@ -70,7 +70,7 @@ export function groupByAggregate(
     return { rows, headers: [] };
   }
   
-  const groups: Record<string, { keys: Record<string, any>; values: Record<string, any[]> }> = {};
+  const groups: Record<string, { keys: Record<string, any>; values: Record<string, any>[] }> = {};
   
   // Group rows
   rows.forEach(row => {

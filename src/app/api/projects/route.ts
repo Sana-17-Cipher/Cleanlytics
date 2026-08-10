@@ -4,7 +4,7 @@ export async function GET(request: Request) {
   try {
     const authHeader = request.headers.get('authorization');
 
-    const backendRes = await fetch('http://localhost:8000/api/projects', {
+    const backendRes = await fetch('http://localhost:8005/api/projects', {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -26,7 +26,7 @@ export async function POST(request: Request) {
     const authHeader = request.headers.get('authorization');
     const body = await request.json();
 
-    const backendRes = await fetch('http://localhost:8000/api/projects', {
+    const backendRes = await fetch('http://localhost:8005/api/projects', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -43,3 +43,4 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: error.message || 'Failed to create project' }, { status: 500 });
   }
 }
+

@@ -4,7 +4,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     
-    const backendRes = await fetch('http://localhost:8000/api/insights', {
+    const backendRes = await fetch('http://localhost:8005/api/apply-suggestion', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

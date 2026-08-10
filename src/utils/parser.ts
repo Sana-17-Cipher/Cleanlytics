@@ -18,6 +18,7 @@ export interface Dataset {
   stats: Record<string, ColumnStats>;
   fileName: string;
   fileSize: number;
+  projectId?: number | string;
 }
 
 // Check if a value represents a date
@@ -298,5 +299,116 @@ export function processDataset(data: Record<string, any>[], fileName: string, fi
     stats,
     fileName,
     fileSize
+  };
+}
+
+/**
+ * Rebuild a Dataset from raw row data without needing a File object.
+ * Useful after backend transformations return new row data.
+ */
+export function processRawRows(
+  rawRows: Record<string, any>[],
+  fileName: string,
+  fileSize: number = 0,
+  projectId?: number | string
+): Dataset {
+  if (!rawRows || rawRows.length === 0) {
+    return {
+      headers: [],
+      rows: [],
+      types: {},
+      nullCounts: {},
+      stats: {},
+      fileName,
+      fileSize,
+      projectId,
+    };
+  }
+
+  const headers = Object.keys(rawRows[0]);
+  const rows = rawRows;
+
+  // Infer types
+  const types: Record<string, DataType> = {};
+  const nullCounts: Record<string, number> = {};
+
+  headers.forEach(header => {
+    nullCounts[header] = 0;
+    const typeCounts: Record<string, number> = { number: 0, string: 0, date: 0, boolean: 0 };
+
+    rows.forEach(row => {
+      const val = row[header];
+      if (val === null || val === undefined || val === '') {
+        nullCounts[header]++;
+        return;
+      }
+      if (typeof val === 'boolean' || val === 'true' || val === 'false') {
+        typeCounts.boolean++;
+      } else if (typeof val === 'number' || (!isNaN(Number(val)) && String(val).trim() !== '')) {
+        typeCounts.number++;
+      } else if (isDate(val)) {
+        typeCounts.date++;
+      } else {
+        typeCounts.string++;
+      }
+    });
+
+    let maxType: DataType = 'string';
+    let maxCount = 0;
+    for (const [t, c] of Object.entries(typeCounts)) {
+      if (c > maxCount) {
+        maxCount = c;
+        maxType = t as DataType;
+      }
+    }
+    types[header] = maxType;
+  });
+
+  // Coerce numeric values
+  rows.forEach(row => {
+    headers.forEach(header => {
+      const val = row[header];
+      if (val !== null && val !== undefined && types[header] === 'number' && typeof val !== 'number') {
+        const num = Number(val);
+        row[header] = isNaN(num) ? val : num;
+      }
+    });
+  });
+
+  // Compute stats
+  const stats: Record<string, ColumnStats> = {};
+  headers.forEach(header => {
+    if (types[header] === 'number') {
+      const values = rows
+        .map(row => row[header])
+        .filter(val => typeof val === 'number' && !isNaN(val)) as number[];
+
+      if (values.length > 0) {
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const sum = values.reduce((a, b) => a + b, 0);
+        const mean = sum / values.length;
+
+        const sorted = [...values].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
+        const stdDev = Math.sqrt(variance);
+
+        stats[header] = { min, max, mean, median, stdDev };
+      }
+    }
+  });
+
+  return {
+    headers,
+    rows,
+    types,
+    nullCounts,
+    stats,
+    fileName,
+    fileSize,
+    projectId,
   };
 }

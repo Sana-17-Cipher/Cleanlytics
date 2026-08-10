@@ -12,13 +12,13 @@ import {
   BarChart3, LineChart as LineChartIcon, PieChart as PieChartIcon,
   AreaChart as AreaChartIcon, Table2, ScatterChart as ScatterIcon,
   X, Activity, Hash, Type,
-  Calendar, ArrowUpRight, ArrowDownRight, GripVertical, Settings,
+  Calendar, ArrowUpRight, ArrowDownRight, GripVertical, Settings, Download
 } from 'lucide-react';
 import { Responsive, WidthProvider } from 'react-grid-layout/legacy';
-import type { Layout } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
 import { Dataset } from '../utils/parser';
+import type { SemanticProfile, DataTableMeta, RelationshipCandidate } from '../utils/profiler';
 
 const ResponsiveGridLayout = WidthProvider(Responsive);
 
@@ -45,6 +45,9 @@ interface KPIItem {
 
 interface DashboardBuilderProps {
   dataset: Dataset;
+  profile?: SemanticProfile | null;
+  tables?: DataTableMeta[];
+  relationships?: RelationshipCandidate[];
 }
 
 /* ─────────────────────────── CONSTANTS ─────────────────────────── */
@@ -132,12 +135,12 @@ function AnimatedNumber({ value }: { value: number }) {
 
 /* ─────────────────────────── MAIN COMPONENT ─────────────────────────── */
 
-export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
+export default function DashboardBuilder({ dataset, profile, tables = [], relationships = [] }: DashboardBuilderProps) {
   const { headers, rows, types } = dataset;
 
   const [mounted, setMounted] = useState(false);
   const [widgets, setWidgets] = useState<DashboardWidget[]>([]);
-  const [layouts, setLayouts] = useState<{ [key: string]: Layout[] }>({});
+  const [layouts, setLayouts] = useState<{ [key: string]: any[] }>({});
   const [showFilters, setShowFilters] = useState(false);
   const [showAddPanel, setShowAddPanel] = useState(false);
   const [activeFilters, setActiveFilters] = useState<Record<string, string>>({});
@@ -151,12 +154,10 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
     }
     setSavingLayout(true);
     try {
-      const token = localStorage.getItem('cleanytics_token');
       const res = await fetch(`/api/projects/${dataset.projectId}/dashboard`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
         },
         body: JSON.stringify({ widgets, layouts }),
       });
@@ -164,7 +165,7 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
       alert("Dashboard widgets and layouts saved successfully!");
     } catch (err) {
       console.error(err);
-      alert("Failed to save dashboard. Make sure you are logged in.");
+      alert("Failed to save dashboard.");
     } finally {
       setSavingLayout(false);
     }
@@ -231,10 +232,7 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
     const loadSavedDashboard = async () => {
       if (dataset.projectId && dataset.projectId !== 'undefined') {
         try {
-          const token = localStorage.getItem('cleanytics_token');
-          const res = await fetch(`/api/projects/${dataset.projectId}/dashboard`, {
-            headers: token ? { 'Authorization': `Bearer ${token}` } : {},
-          });
+          const res = await fetch(`/api/projects/${dataset.projectId}/dashboard`);
           if (res.ok) {
             const data = await res.json();
             if (data.widgets && data.widgets.length > 0) {
@@ -250,56 +248,60 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
 
       // Fallback: Auto-generate widgets
       const auto: DashboardWidget[] = [];
-      const lgLayout: Layout[] = [];
+      const lgLayout: any[] = [];
       let widgetIdx = 0;
       let gridY = 0;
 
+      const smartMeasures = profile ? profile.columns.filter(c => c.semantic_role === 'measure').map(c => c.name) : numericCols;
+      const smartDimensions = profile ? profile.columns.filter(c => ['dimension', 'category', 'id', 'geographic'].includes(c.semantic_role || '')).map(c => c.name) : categoricalCols;
+      const smartTime = profile ? profile.columns.filter(c => c.semantic_role === 'time').map(c => c.name) : dateCols;
+
       // 1. Bar chart
-      if (categoricalCols.length > 0 && numericCols.length > 0) {
-        const bestCat = categoricalCols.find(c => {
+      if (smartDimensions.length > 0 && smartMeasures.length > 0) {
+        const bestCat = smartDimensions.find(c => {
           const uniq = new Set(rows.map(r => r[c])).size;
           return uniq >= 2 && uniq <= 20;
-        }) || categoricalCols[0];
+        }) || smartDimensions[0];
 
         const id = `auto-bar-${widgetIdx++}`;
-        auto.push({ id, type: 'bar', title: `${numericCols[0]} by ${bestCat}`, xCol: bestCat, yCol: numericCols[0], agg: 'sum' });
+        auto.push({ id, type: 'bar', title: `${smartMeasures[0]} by ${bestCat}`, xCol: bestCat, yCol: smartMeasures[0], agg: 'sum' });
         lgLayout.push({ i: id, x: 0, y: gridY, w: 8, h: 4 });
       }
 
       // 2. Donut chart
-      if (categoricalCols.length > 0 && numericCols.length > 0) {
-        const pieCat = categoricalCols.find(c => {
+      if (smartDimensions.length > 0 && smartMeasures.length > 0) {
+        const pieCat = smartDimensions.find(c => {
           const uniq = new Set(rows.map(r => r[c])).size;
           return uniq >= 2 && uniq <= 10;
-        }) || categoricalCols[0];
+        }) || smartDimensions[0];
 
         const id = `auto-pie-${widgetIdx++}`;
-        auto.push({ id, type: 'pie', title: `${pieCat} Distribution`, xCol: pieCat, yCol: numericCols[0], agg: 'sum' });
+        auto.push({ id, type: 'pie', title: `${pieCat} Distribution`, xCol: pieCat, yCol: smartMeasures[0], agg: 'sum' });
         lgLayout.push({ i: id, x: 8, y: gridY, w: 4, h: 4 });
       }
 
       gridY += 4;
 
       // 3. Line chart (time series)
-      if (dateCols.length > 0 && numericCols.length > 0) {
+      if (smartTime.length > 0 && smartMeasures.length > 0) {
         const id = `auto-line-${widgetIdx++}`;
-        auto.push({ id, type: 'line', title: `${numericCols[0]} Trend over ${dateCols[0]}`, xCol: dateCols[0], yCol: numericCols[0], agg: 'sum' });
+        auto.push({ id, type: 'line', title: `${smartMeasures[0]} Trend over ${smartTime[0]}`, xCol: smartTime[0], yCol: smartMeasures[0], agg: 'sum' });
         lgLayout.push({ i: id, x: 0, y: gridY, w: 12, h: 4 });
         gridY += 4;
       }
 
       // 4. Area chart
-      if (numericCols.length >= 2 && (dateCols.length > 0 || categoricalCols.length > 0)) {
-        const xCol = dateCols[0] || categoricalCols[0];
+      if (smartMeasures.length >= 2 && (smartTime.length > 0 || smartDimensions.length > 0)) {
+        const xCol = smartTime[0] || smartDimensions[0];
         const id = `auto-area-${widgetIdx++}`;
-        auto.push({ id, type: 'area', title: `${numericCols[1]} by ${xCol}`, xCol, yCol: numericCols[1], agg: 'sum' });
+        auto.push({ id, type: 'area', title: `${smartMeasures[1]} by ${xCol}`, xCol, yCol: smartMeasures[1], agg: 'sum' });
         lgLayout.push({ i: id, x: 0, y: gridY, w: 7, h: 4 });
       }
 
       // 5. Scatter
-      if (numericCols.length >= 2) {
+      if (smartMeasures.length >= 2) {
         const id = `auto-scatter-${widgetIdx++}`;
-        auto.push({ id, type: 'scatter', title: `${numericCols[0]} vs ${numericCols[1]}`, xCol: numericCols[0], yCol: numericCols[1], agg: 'sum' });
+        auto.push({ id, type: 'scatter', title: `${smartMeasures[0]} vs ${smartMeasures[1]}`, xCol: smartMeasures[0], yCol: smartMeasures[1], agg: 'sum' });
         lgLayout.push({ i: id, x: 7, y: gridY, w: 5, h: 4 });
       }
 
@@ -308,7 +310,7 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
     };
 
     loadSavedDashboard();
-  }, [dataset]);
+  }, [dataset, profile]);
 
   // ─── Filtered rows ───
   const filteredRows = useMemo(() => {
@@ -442,7 +444,7 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
       const gridW = type === 'kpi' ? 3 : type === 'pie' ? 4 : type === 'table' ? 12 : 6;
       const gridH = type === 'kpi' ? 2 : 4;
 
-      const newLayout: Layout = {
+      const newLayout: any = {
         i: w.id, x: 0, y: maxY,
         w: gridW,
         h: gridH,
@@ -470,7 +472,7 @@ export default function DashboardBuilder({ dataset }: DashboardBuilderProps) {
     setWidgets(prev => prev.map(w => w.id === id ? { ...w, ...updates } : w));
   };
 
-  const handleLayoutChange = (_layout: Layout[], allLayouts: { [key: string]: Layout[] }) => {
+  const handleLayoutChange = (currentLayout: any, allLayouts: any) => {
     setLayouts(allLayouts);
   };
 

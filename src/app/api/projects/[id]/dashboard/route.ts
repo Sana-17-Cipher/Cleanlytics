@@ -5,7 +5,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const authHeader = request.headers.get('authorization');
     const { id } = await params;
 
-    const backendRes = await fetch(`http://localhost:8000/api/projects/${id}/dashboard`, {
+    const backendRes = await fetch(`http://localhost:8005/api/projects/${id}/dashboard`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -28,7 +28,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { id } = await params;
     const body = await request.json();
 
-    const backendRes = await fetch(`http://localhost:8000/api/projects/${id}/dashboard`, {
+    const backendRes = await fetch(`http://localhost:8005/api/projects/${id}/dashboard`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -45,3 +45,4 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: error.message || 'Failed to save dashboard' }, { status: 500 });
   }
 }
+

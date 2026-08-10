@@ -4,7 +4,7 @@ export async function GET(request: Request) {
   try {
     const authHeader = request.headers.get('authorization');
 
-    const backendRes = await fetch('http://localhost:8000/api/auth/me', {
+    const backendRes = await fetch('http://localhost:8005/api/auth/me', {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -26,3 +26,4 @@ export async function GET(request: Request) {
     );
   }
 }
+

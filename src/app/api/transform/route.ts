@@ -4,7 +4,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     
-    const backendRes = await fetch('http://localhost:8000/api/transform', {
+    const backendRes = await fetch('http://localhost:8005/api/transform', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -18,3 +18,4 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: error.message || 'Error proxying request' }, { status: 500 });
   }
 }
+

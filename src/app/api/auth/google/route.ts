@@ -4,7 +4,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
 
-    const backendRes = await fetch('http://localhost:8000/api/auth/google', {
+    const backendRes = await fetch('http://localhost:8005/api/auth/google', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -24,3 +24,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

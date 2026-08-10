@@ -5,7 +5,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const authHeader = request.headers.get('authorization');
     const { id } = await params;
 
-    const backendRes = await fetch(`http://localhost:8000/api/projects/${id}`, {
+    const backendRes = await fetch(`http://localhost:8005/api/projects/${id}`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -27,7 +27,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     const authHeader = request.headers.get('authorization');
     const { id } = await params;
 
-    const backendRes = await fetch(`http://localhost:8000/api/projects/${id}`, {
+    const backendRes = await fetch(`http://localhost:8005/api/projects/${id}`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
@@ -43,3 +43,4 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     return NextResponse.json({ error: error.message || 'Failed to delete project' }, { status: 500 });
   }
 }
+

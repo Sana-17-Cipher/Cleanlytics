@@ -50,7 +50,7 @@ export default function AuthModal({ isOpen, onClose, onAuthSuccess }: AuthModalP
 
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.detail || 'Authentication failed');
+        throw new Error(err.detail || err.error || 'Authentication failed');
       }
 
       const data = await res.json();

@@ -1,20 +1,27 @@
-import React, { useState, useEffect } from 'react';
-import { Merge, Columns, Sigma, Plus, Trash2, Check, RotateCcw, AlertTriangle } from 'lucide-react';
-import { Dataset } from '../utils/parser';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Merge, Columns, Sigma, Plus, Trash2, Check, RotateCcw, AlertTriangle, Zap, TrendingUp, Layers, Tag, Calendar, Hash, Type as TypeIcon, ArrowRight } from 'lucide-react';
+import { Dataset, processRawRows } from '../utils/parser';
 import { mergeColumns, splitColumn, groupByAggregate, addCalculatedColumn, AggregationConfig } from '../utils/transformer';
+import type { SemanticProfile, TransformationSuggestion, MeasureRecommendation } from '../utils/profiler';
 
 interface TransformModuleProps {
   dataset: Dataset;
   onDatasetUpdated: (newDataset: Dataset, actionDesc: string) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  profile?: SemanticProfile | null;
+  transformSuggestions?: TransformationSuggestion[];
+  measureRecommendations?: MeasureRecommendation[];
+  onApplySuggestion?: (suggestion: TransformationSuggestion) => void;
 }
 
 type TransformType = 'merge' | 'split' | 'math' | 'groupby';
+type TransformMode = 'suggested' | 'manual';
 
-export default function TransformModule({ dataset, onDatasetUpdated, onUndo, canUndo }: TransformModuleProps) {
+export default function TransformModule({ dataset, onDatasetUpdated, onUndo, canUndo, profile, transformSuggestions = [], measureRecommendations = [], onApplySuggestion }: TransformModuleProps) {
   const { headers, rows, types } = dataset;
   
+  const [mode, setMode] = useState<TransformMode>(transformSuggestions.length > 0 ? 'suggested' : 'manual');
   const [activeTab, setActiveTab] = useState<TransformType>('merge');
   const [previewRows, setPreviewRows] = useState<Record<string, any>[]>([]);
   const [previewHeaders, setPreviewHeaders] = useState<string[]>([]);
@@ -271,22 +278,22 @@ export default function TransformModule({ dataset, onDatasetUpdated, onUndo, can
       
       const result = await res.json();
       
-      // We will re-parse the result using our parser to rebuild types & stats
-      import('../utils/parser').then(({ processDataset }) => {
-        const file = new File([JSON.stringify(result.data)], dataset.fileName, { type: 'application/json' });
-        // processDataset handles stats, headers, nullCounts automatically
-        processDataset(file).then(newDataset => {
-          onDatasetUpdated(newDataset, desc);
-          
-          // Reset states
-          setMergeSrcCols([]);
-          setMergeTargetCol('');
-          setSplitTargets(['', '']);
-          setMathTargetCol('');
-          setGroupKeys([]);
-          setAggregates([{ column: '', func: 'sum', outputName: '' }]);
-        });
-      });
+      // Rebuild the Dataset from the transformed row data
+      const newDataset = processRawRows(
+        result.data,
+        dataset.fileName,
+        dataset.fileSize,
+        dataset.projectId
+      );
+      onDatasetUpdated(newDataset, desc);
+      
+      // Reset states
+      setMergeSrcCols([]);
+      setMergeTargetCol('');
+      setSplitTargets(['', '']);
+      setMathTargetCol('');
+      setGroupKeys([]);
+      setAggregates([{ column: '', func: 'sum', outputName: '' }]);
     } catch (err: any) {
       alert("Error applying transformation: " + err?.message);
     } finally {
@@ -294,8 +301,192 @@ export default function TransformModule({ dataset, onDatasetUpdated, onUndo, can
     }
   };
 
+  const ROLE_COLORS: Record<string, { bg: string; text: string; border: string }> = {
+    measure:    { bg: 'bg-emerald-950/40', text: 'text-emerald-400', border: 'border-emerald-800/30' },
+    dimension:  { bg: 'bg-cyan-950/40',    text: 'text-cyan-400',    border: 'border-cyan-800/30' },
+    time:       { bg: 'bg-amber-950/40',   text: 'text-amber-400',   border: 'border-amber-800/30' },
+    id:         { bg: 'bg-gray-900/40',    text: 'text-gray-400',    border: 'border-gray-800/30' },
+    geographic: { bg: 'bg-violet-950/40',  text: 'text-violet-400',  border: 'border-violet-800/30' },
+    category:   { bg: 'bg-blue-950/40',    text: 'text-blue-400',    border: 'border-blue-800/30' },
+    boolean:    { bg: 'bg-pink-950/40',    text: 'text-pink-400',    border: 'border-pink-800/30' },
+    text:       { bg: 'bg-gray-900/40',    text: 'text-gray-400',    border: 'border-gray-800/30' },
+  };
+
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-fade-in">
+    <div className="space-y-5 animate-fade-in">
+
+      {/* ═══════ Mode Toggle ═══════ */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight text-white">Transformations</h2>
+          <p className="text-xs text-gray-500 mt-0.5">Shape your data for analysis and dashboard building</p>
+        </div>
+        <div className="flex items-center gap-1 p-0.5 rounded-lg bg-zinc-900/60 border border-gray-800/60">
+          <button
+            onClick={() => setMode('suggested')}
+            className={`px-3 py-1.5 rounded-md text-[11px] font-semibold transition ${mode === 'suggested' ? 'bg-cyan-950/50 text-cyan-400 border border-cyan-800/30' : 'text-gray-400 hover:text-gray-200'}`}
+          >
+            Suggested
+            {transformSuggestions.length > 0 && (
+              <span className="ml-1.5 text-[9px] font-bold px-1 py-0.5 rounded-full bg-cyan-500/15 text-cyan-400">
+                {transformSuggestions.length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setMode('manual')}
+            className={`px-3 py-1.5 rounded-md text-[11px] font-semibold transition ${mode === 'manual' ? 'bg-cyan-950/50 text-cyan-400 border border-cyan-800/30' : 'text-gray-400 hover:text-gray-200'}`}
+          >
+            Manual
+          </button>
+        </div>
+      </div>
+
+      {/* ═══════ Suggested Mode ═══════ */}
+      {mode === 'suggested' && (
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+          {/* Suggestions List */}
+          <div className="xl:col-span-2 space-y-4">
+            {/* Transformation Suggestions */}
+            {transformSuggestions.length > 0 ? (
+              <div className="glass-panel rounded-xl border border-gray-800/40 overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-800/50">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Zap className="h-4 w-4 text-violet-400" />
+                    Smart Suggestions
+                  </h3>
+                  <p className="text-[10px] text-gray-500 mt-0.5">Based on semantic analysis of your dataset</p>
+                </div>
+                <div className="p-4 space-y-2">
+                  {transformSuggestions.map(s => (
+                    <div
+                      key={s.id}
+                      className="p-3.5 rounded-lg border border-gray-800/40 bg-zinc-900/20 hover:border-violet-800/30 transition group flex items-start justify-between gap-4"
+                    >
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] font-bold text-violet-400 bg-violet-950/30 px-1.5 py-0.5 rounded border border-violet-900/30">
+                            {s.type === 'date_decomposition' ? 'Date Split' : 'Derived'}
+                          </span>
+                          <span className="text-[9px] font-mono text-gray-500">
+                            → {s.new_column}
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-semibold text-white">{s.name}</p>
+                        <p className="text-[10px] text-gray-500 leading-relaxed">{s.reason}</p>
+                      </div>
+                      {onApplySuggestion && (
+                        <button
+                          onClick={() => onApplySuggestion(s)}
+                          className="px-3 py-1.5 rounded-lg text-[10px] font-semibold bg-emerald-950/40 text-emerald-400 border border-emerald-800/30 hover:bg-emerald-900/40 transition shrink-0 opacity-70 group-hover:opacity-100"
+                        >
+                          Apply
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="glass-panel rounded-xl border border-gray-800/40 p-8 text-center">
+                <Zap className="h-8 w-8 text-gray-700 mx-auto mb-3" />
+                <p className="text-xs text-gray-400 font-medium">No suggestions available</p>
+                <p className="text-[10px] text-gray-500 mt-1">Upload a dataset with date or numeric columns for smart suggestions</p>
+              </div>
+            )}
+
+            {/* Measures Panel */}
+            {measureRecommendations.length > 0 && (
+              <div className="glass-panel rounded-xl border border-gray-800/40 overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-800/50">
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                    <TrendingUp className="h-4 w-4 text-emerald-400" />
+                    Recommended Measures
+                  </h3>
+                  <p className="text-[10px] text-gray-500 mt-0.5">Analytics measures generated from your data model</p>
+                </div>
+                <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                  {measureRecommendations.map(m => (
+                    <div
+                      key={m.id}
+                      className="p-3 rounded-lg border border-gray-800/40 bg-zinc-900/20 hover:border-emerald-800/30 transition space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-white">{m.name}</span>
+                        <span className="text-[9px] font-mono text-emerald-400 bg-emerald-950/30 px-1.5 py-0.5 rounded border border-emerald-900/30">
+                          {m.aggregation}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-gray-400 font-mono">{m.formula}</p>
+                      <p className="text-[10px] text-gray-500 leading-relaxed">{m.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Data Model Sidebar */}
+          <div className="space-y-4">
+            <div className="glass-panel rounded-xl border border-gray-800/40 p-5 space-y-4">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Layers className="h-4 w-4 text-cyan-400" />
+                Data Model
+              </h3>
+              {profile ? (
+                <div className="space-y-3">
+                  {Object.entries(
+                    profile.columns.reduce((acc, col) => {
+                      const role = col.semantic_role;
+                      if (!acc[role]) acc[role] = [];
+                      acc[role].push(col);
+                      return acc;
+                    }, {} as Record<string, typeof profile.columns>)
+                  ).map(([role, cols]) => {
+                    const rc = ROLE_COLORS[role] || ROLE_COLORS.text;
+                    return (
+                      <div key={role}>
+                        <p className={`text-[9px] font-bold uppercase tracking-wider mb-1.5 ${rc.text}`}>
+                          {role}s ({cols.length})
+                        </p>
+                        <div className="space-y-1">
+                          {cols.map(col => (
+                            <div
+                              key={col.name}
+                              className={`px-2.5 py-1.5 rounded-lg text-[10px] border ${rc.bg} ${rc.border} flex items-center justify-between`}
+                            >
+                              <span className={`font-medium ${rc.text}`}>{col.name}</span>
+                              <span className="text-[8px] text-gray-500 font-mono">{col.aggregation_behavior}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-[10px] text-gray-500">Profiling data not available</p>
+              )}
+            </div>
+
+            {/* Quick action to manual mode */}
+            <button
+              onClick={() => setMode('manual')}
+              className="w-full px-4 py-3 rounded-xl border border-gray-800/40 bg-zinc-900/20 hover:border-cyan-800/30 transition text-left group flex items-center justify-between"
+            >
+              <div>
+                <p className="text-xs font-semibold text-gray-200">Manual Transforms</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Merge, Split, Math, Group By</p>
+              </div>
+              <ArrowRight className="h-3.5 w-3.5 text-gray-600 group-hover:text-cyan-400 transition" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ Manual Mode ═══════ */}
+      {mode === 'manual' && (
+    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
       {/* Transformation Config Left panel */}
       <div className="xl:col-span-1 space-y-6">
         <div className="glass-panel p-5 rounded-xl space-y-5">
@@ -715,6 +906,8 @@ export default function TransformModule({ dataset, onDatasetUpdated, onUndo, can
           </div>
         </div>
       </div>
+    </div>
+    )}
     </div>
   );
 }

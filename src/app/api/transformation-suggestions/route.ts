@@ -2,11 +2,14 @@ import { NextResponse } from 'next/server';
 
 export async function POST(request: Request) {
   try {
-    const formData = await request.formData();
+    const body = await request.json();
     
-    const backendRes = await fetch('http://localhost:8005/api/upload', {
+    const backendRes = await fetch('http://localhost:8005/api/transformation-suggestions', {
       method: 'POST',
-      body: formData,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
     });
     
     const data = await backendRes.json();
@@ -15,4 +18,3 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: error.message || 'Error proxying request' }, { status: 500 });
   }
 }
-

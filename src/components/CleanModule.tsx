@@ -1,13 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { ShieldCheck, AlertCircle, RefreshCw, Check, Trash2, Edit2, RotateCcw } from 'lucide-react';
+import { ShieldCheck, AlertCircle, RefreshCw, Check, Trash2, Edit2, RotateCcw, AlertTriangle, Zap, ChevronDown, ChevronUp } from 'lucide-react';
 import { Dataset } from '../utils/parser';
 import { removeDuplicates, handleNulls, formatDates, standardizeText, correctCasing } from '../utils/cleaner';
+import type { QualitySuggestion } from '../utils/profiler';
 
 interface CleanModuleProps {
   dataset: Dataset;
   onDatasetUpdated: (newDataset: Dataset, actionDesc: string) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  qualitySuggestions?: QualitySuggestion[];
+  onApplySuggestion?: (suggestion: QualitySuggestion) => void;
 }
 
 interface ColumnCleaningConfig {
@@ -22,8 +25,9 @@ interface ColumnCleaningConfig {
   validatePhone: boolean;
 }
 
-export default function CleanModule({ dataset, onDatasetUpdated, onUndo, canUndo }: CleanModuleProps) {
+export default function CleanModule({ dataset, onDatasetUpdated, onUndo, canUndo, qualitySuggestions = [], onApplySuggestion }: CleanModuleProps) {
   const { headers, rows, types, stats } = dataset;
+  const [showIssuesPanel, setShowIssuesPanel] = useState(true);
   
   // Clean configuration states
   const [dedupeAll, setDedupeAll] = useState(false);
@@ -233,8 +237,99 @@ export default function CleanModule({ dataset, onDatasetUpdated, onUndo, canUndo
 
   const activeConfig = columnConfigs[activeTabCol];
 
+  const SEVERITY_STYLES: Record<string, string> = {
+    high:   'border-red-900/40 bg-red-950/20',
+    medium: 'border-amber-900/40 bg-amber-950/20',
+    low:    'border-gray-800/40 bg-zinc-900/20',
+  };
+
+  const SEVERITY_TEXT: Record<string, string> = {
+    high:   'text-red-400',
+    medium: 'text-amber-400',
+    low:    'text-gray-400',
+  };
+
+  const TIER_INFO: Record<string, { label: string; color: string }> = {
+    A: { label: 'Safe to auto-apply', color: 'text-emerald-400' },
+    B: { label: 'Recommended', color: 'text-cyan-400' },
+    C: { label: 'Needs review', color: 'text-amber-400' },
+  };
+
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-fade-in">
+    <div className="space-y-5 animate-fade-in">
+
+      {/* ═══════ Detected Issues Panel ═══════ */}
+      {qualitySuggestions.length > 0 && (
+        <div className="glass-panel rounded-xl border border-gray-800/40 overflow-hidden">
+          <button
+            onClick={() => setShowIssuesPanel(!showIssuesPanel)}
+            className="w-full px-5 py-4 flex items-center justify-between hover:bg-zinc-900/20 transition"
+          >
+            <div className="flex items-center gap-3">
+              <div className="h-8 w-8 rounded-lg bg-amber-950/40 border border-amber-800/30 flex items-center justify-center">
+                <AlertTriangle className="h-4 w-4 text-amber-400" />
+              </div>
+              <div className="text-left">
+                <h3 className="text-sm font-bold text-white">Detected Issues</h3>
+                <p className="text-[10px] text-gray-500 mt-0.5">
+                  {qualitySuggestions.length} quality issue{qualitySuggestions.length !== 1 ? 's' : ''} found — review or apply recommended fixes
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold text-amber-400 bg-amber-950/30 px-2 py-0.5 rounded border border-amber-900/30">
+                {qualitySuggestions.length}
+              </span>
+              {showIssuesPanel ? <ChevronUp className="h-4 w-4 text-gray-500" /> : <ChevronDown className="h-4 w-4 text-gray-500" />}
+            </div>
+          </button>
+
+          {showIssuesPanel && (
+            <div className="px-5 pb-4 space-y-2 border-t border-gray-800/40 pt-3">
+              {qualitySuggestions.map(issue => {
+                const tier = TIER_INFO[issue.risk_tier] || TIER_INFO.B;
+                return (
+                  <div
+                    key={issue.id}
+                    className={`p-3.5 rounded-lg border ${SEVERITY_STYLES[issue.severity]} flex items-start justify-between gap-4 group transition hover:border-gray-700/60`}
+                  >
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-[9px] font-bold uppercase tracking-wider ${SEVERITY_TEXT[issue.severity]}`}>
+                          {issue.severity}
+                        </span>
+                        {issue.column && (
+                          <span className="text-[9px] font-mono text-gray-500 bg-zinc-900/60 px-1.5 py-0.5 rounded">
+                            {issue.column}
+                          </span>
+                        )}
+                        <span className={`text-[8px] font-bold ${tier.color}`}>
+                          Tier {issue.risk_tier}
+                        </span>
+                      </div>
+                      <p className="text-[11px] font-medium text-gray-200 leading-snug">{issue.description}</p>
+                      <p className="text-[10px] text-gray-500">{issue.why}</p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {onApplySuggestion && (
+                        <button
+                          onClick={() => onApplySuggestion(issue)}
+                          className="px-3 py-1.5 rounded-lg text-[10px] font-semibold bg-emerald-950/40 text-emerald-400 border border-emerald-800/30 hover:bg-emerald-900/40 hover:text-emerald-300 transition opacity-70 group-hover:opacity-100"
+                        >
+                          Apply Fix
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══════ Manual Cleaning Controls ═══════ */}
+    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
       {/* Cleaning Config Sidebar */}
       <div className="xl:col-span-1 space-y-6">
         <div className="glass-panel p-5 rounded-xl space-y-5">
@@ -552,6 +647,7 @@ export default function CleanModule({ dataset, onDatasetUpdated, onUndo, canUndo
           </div>
         </div>
       </div>
+    </div>
     </div>
   );
 }
