@@ -49,3 +49,7 @@ __pycache__/
 *.png
 *.docx
 generate_*.py
+
+# Backend runtime data: per-project DuckDB files, staged uploads, metadata DB
+backend/data/
+backend/venv/
