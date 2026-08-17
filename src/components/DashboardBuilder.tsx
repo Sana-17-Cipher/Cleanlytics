@@ -3,13 +3,17 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart,
-  Pie, PieChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis,
+  Funnel, FunnelChart, LabelList, Pie, PieChart, PolarAngleAxis, PolarGrid,
+  PolarRadiusAxis, Radar, RadarChart, RadialBar, RadialBarChart, ResponsiveContainer,
+  Scatter, ScatterChart, Tooltip, Treemap, XAxis, YAxis,
 } from 'recharts';
 import {
   Grid3x3, Loader2, Plus, Save, Settings2, Trash2, TriangleAlert,
 } from 'lucide-react';
 
 import { ApiError, api } from '../lib/api';
+import { CUSTOM_CHART_OPTIONS } from '../lib/dashboard-widgets';
+import type { CustomChartType } from '../lib/dashboard-widgets';
 import { compact, count, exact } from '../lib/format';
 import type {
   Aggregation, ModelFieldGroup, QueryResult, QuerySpec, SemanticModel,
@@ -39,12 +43,10 @@ function axisNumber(value: unknown): string {
   return typeof value === 'number' ? compact(value) : String(value ?? '');
 }
 
-type ChartType = 'bar' | 'line' | 'area' | 'pie' | 'scatter' | 'table' | 'kpi';
-
 interface Widget {
   id: string;
   title: string;
-  chart: ChartType;
+  chart: CustomChartType;
   dimension: { table_id: number; column: string; date_part?: string } | null;
   measure: { table_id: number; column: string | null; aggregation: Aggregation };
   limit: number;
@@ -78,27 +80,6 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
     return map;
   }, [model.fields]);
 
-  /* ── Build a starting dashboard from the model's own suggestions ────── */
-
-  const defaultWidgets = useCallback((): Widget[] => {
-    return model.suggestions.slice(0, 4).map((suggestion, index) => {
-      const dimension = suggestion.spec.dimensions?.[0];
-      const measure = suggestion.spec.measures?.[0];
-      return {
-        id: `w${index}-${suggestion.id}`,
-        title: suggestion.title,
-        chart: (suggestion.chart as ChartType) ?? 'bar',
-        dimension: dimension
-          ? { table_id: dimension.table_id, column: dimension.column, date_part: dimension.date_part ?? undefined }
-          : null,
-        measure: measure
-          ? { table_id: measure.table_id, column: measure.column ?? null, aggregation: measure.aggregation }
-          : { table_id: model.tables[0]?.id ?? 0, column: null, aggregation: 'count' },
-        limit: 25,
-      };
-    });
-  }, [model.suggestions, model.tables]);
-
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -106,15 +87,18 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
         const saved = await api.getDashboard(projectId);
         if (cancelled) return;
         const savedWidgets = saved.widgets as Widget[];
-        setWidgets(savedWidgets.length > 0 ? savedWidgets : defaultWidgets());
+        // Earlier versions silently created four suggestion charts with these
+        // ids. They stay out of the manual workspace; only graphs the user
+        // explicitly added are restored here.
+        setWidgets(savedWidgets.filter((widget) => !/^w\d+-/.test(widget.id)));
       } catch {
-        if (!cancelled) setWidgets(defaultWidgets());
+        if (!cancelled) setWidgets([]);
       } finally {
         if (!cancelled) setLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [projectId, defaultWidgets]);
+  }, [projectId]);
 
   /* ── Run each widget's query ─────────────────────────────────────────── */
 
@@ -159,16 +143,26 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
   const addWidget = () => {
     const table = model.tables.find((t) => t.kind === 'fact') ?? model.tables[0];
     if (!table) return;
-    const group = fieldsByTable.get(table.id);
-    const dimension = group?.columns.find((c) =>
-      ['category', 'dimension', 'geographic'].includes(c.semantic_role) && c.distinct_count <= 50);
-    const measure = group?.columns.find((c) => c.semantic_role === 'measure');
+    const factFields = fieldsByTable.get(table.id);
+    const dimensionGroup = model.fields.find((group) => group.columns.some((column) =>
+      ['category', 'dimension', 'geographic'].includes(column.semantic_role)
+      && column.distinct_count >= 2
+      && column.distinct_count <= 50));
+    const dimension = dimensionGroup?.columns.find((column) =>
+      ['category', 'dimension', 'geographic'].includes(column.semantic_role)
+      && column.distinct_count >= 2
+      && column.distinct_count <= 50);
+    const measure = factFields?.columns
+      .filter((column) => column.semantic_role === 'measure')
+      .sort((a, b) => b.distinct_count - a.distinct_count)[0];
 
     const widget: Widget = {
-      id: `w-${widgets.length}-${table.id}-${dimension?.name ?? 'rows'}`,
+      id: `custom-${crypto.randomUUID()}`,
       title: measure && dimension ? `${measure.name} by ${dimension.name}` : `${table.table_name} rows`,
-      chart: 'bar',
-      dimension: dimension ? { table_id: table.id, column: dimension.name } : null,
+      chart: 'area',
+      dimension: dimension && dimensionGroup
+        ? { table_id: dimensionGroup.table_id, column: dimension.name }
+        : null,
       measure: measure
         ? { table_id: table.id, column: measure.name, aggregation: measure.default_aggregation }
         : { table_id: table.id, column: null, aggregation: 'count' },
@@ -214,13 +208,12 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
   }
 
   return (
-    <div className="space-y-5 animate-fade-in">
+    <section className="space-y-4 rounded-2xl border border-gray-800 bg-zinc-900/30 p-4 animate-fade-in">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-xl font-bold tracking-tight text-white">Dashboard</h2>
-          <p className="text-xs text-gray-400 mt-1">
-            Every figure is calculated by the server across your linked tables, so these numbers match
-            the rest of the app.
+          <h2 className="text-sm font-bold tracking-tight text-white">Your graphs</h2>
+          <p className="text-[11px] text-gray-500 mt-1">
+            Add only the graphs you want, then choose the grouping, value, and calculation.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -231,22 +224,24 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
           >
             <Plus className="h-3.5 w-3.5" /> Add chart
           </button>
-          <button
-            onClick={save}
-            disabled={saving}
-            className="px-3 py-2 rounded-lg border border-gray-800 bg-zinc-900/60 text-gray-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
-          >
-            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-            Save
-          </button>
+          {widgets.length > 0 && (
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-3 py-2 rounded-lg border border-gray-800 bg-zinc-900/60 text-gray-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+              Save graphs
+            </button>
+          )}
         </div>
       </div>
 
       {widgets.length === 0 ? (
-        <div className="glass-panel rounded-xl py-20 text-center space-y-2">
-          <Grid3x3 className="h-12 w-12 text-gray-700 mx-auto" />
-          <p className="text-sm font-semibold text-gray-400">Nothing on the dashboard yet</p>
-          <p className="text-xs text-gray-500">Add a chart to get started.</p>
+        <div className="rounded-xl border border-dashed border-gray-800 py-7 text-center space-y-1.5">
+          <Grid3x3 className="h-6 w-6 text-gray-700 mx-auto" />
+          <p className="text-xs font-semibold text-gray-400">No custom graphs</p>
+          <p className="text-[10.5px] text-gray-600">Use Add chart when you want one.</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -264,7 +259,7 @@ export default function DashboardBuilder({ projectId, model }: DashboardBuilderP
           ))}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
@@ -397,7 +392,7 @@ function ChartBody({ widget, rows }: { widget: Widget; rows: { name: string; val
   if (widget.chart === 'pie') {
     const total = rows.reduce((sum, row) => sum + row.value, 0);
     return (
-      <ResponsiveContainer width="99%" height="100%">
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
         <PieChart>
           <Pie data={rows} dataKey="value" nameKey="name" innerRadius="50%" outerRadius="78%" paddingAngle={2} strokeWidth={0}>
             {rows.map((row, index) => <Cell key={row.name} fill={PALETTE[index % PALETTE.length]} />)}
@@ -416,9 +411,73 @@ function ChartBody({ widget, rows }: { widget: Widget; rows: { name: string; val
     );
   }
 
+  if (widget.chart === 'radar') {
+    return (
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
+        <RadarChart data={rows.slice(0, 12)} outerRadius="72%">
+          <PolarGrid stroke="rgba(255,255,255,0.08)" />
+          <PolarAngleAxis dataKey="name" tick={{ fontSize: 9, fill: '#9ca3af' }} />
+          <PolarRadiusAxis tick={false} axisLine={false} />
+          <Radar dataKey="value" stroke="#35e0a1" fill="#35e0a1" fillOpacity={0.3} strokeWidth={2} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={tooltipNumber} />
+        </RadarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (widget.chart === 'radial') {
+    const maximum = Math.max(...rows.map((row) => row.value), 1);
+    const radialRows = rows.slice(0, 8).map((row, index) => ({
+      ...row,
+      fill: PALETTE[index % PALETTE.length],
+    }));
+    return (
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
+        <RadialBarChart data={radialRows} innerRadius="18%" outerRadius="92%" startAngle={90} endAngle={-270}>
+          <PolarAngleAxis type="number" domain={[0, maximum]} tick={false} />
+          <RadialBar dataKey="value" background={{ fill: 'rgba(255,255,255,0.04)' }} cornerRadius={6} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={tooltipNumber} />
+          <Legend iconSize={8} iconType="circle" wrapperStyle={{ fontSize: 9, color: '#9ca3af' }} />
+        </RadialBarChart>
+      </ResponsiveContainer>
+    );
+  }
+
+  if (widget.chart === 'treemap') {
+    return (
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
+        <Treemap
+          data={rows.slice(0, 20)}
+          dataKey="value"
+          nameKey="name"
+          aspectRatio={1.6}
+          stroke="#030712"
+          fill="#10b981"
+          isAnimationActive={false}
+        />
+      </ResponsiveContainer>
+    );
+  }
+
+  if (widget.chart === 'funnel') {
+    return (
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
+        <FunnelChart>
+          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={tooltipNumber} />
+          <Funnel dataKey="value" data={rows.slice(0, 10)} isAnimationActive={false}>
+            {rows.slice(0, 10).map((row, index) => (
+              <Cell key={row.name} fill={PALETTE[index % PALETTE.length]} />
+            ))}
+            <LabelList dataKey="name" position="right" fill="#d1d5db" fontSize={9} />
+          </Funnel>
+        </FunnelChart>
+      </ResponsiveContainer>
+    );
+  }
+
   if (widget.chart === 'scatter') {
     return (
-      <ResponsiveContainer width="99%" height="100%">
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
         <ScatterChart margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
           <XAxis dataKey="name" {...axis} tick={tick} />
@@ -433,7 +492,7 @@ function ChartBody({ widget, rows }: { widget: Widget; rows: { name: string; val
   if (widget.chart === 'line' || widget.chart === 'area') {
     const ChartComponent = widget.chart === 'line' ? LineChart : AreaChart;
     return (
-      <ResponsiveContainer width="99%" height="100%">
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
         <ChartComponent data={rows} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
           <defs>
             <linearGradient id={`fill-${widget.id}`} x1="0" y1="0" x2="0" y2="1">
@@ -455,8 +514,24 @@ function ChartBody({ widget, rows }: { widget: Widget; rows: { name: string; val
     );
   }
 
+  if (widget.chart === 'horizontal_bar') {
+    return (
+      <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
+        <BarChart data={rows.slice(0, 15)} layout="vertical" margin={{ top: 4, right: 16, left: 4, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" horizontal={false} />
+          <XAxis type="number" {...axis} tick={tick} tickFormatter={axisNumber} />
+          <YAxis dataKey="name" type="category" {...axis} tick={tick} width={74} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={tooltipNumber} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+          <Bar dataKey="value" radius={[0, 5, 5, 0]} maxBarSize={24}>
+            {rows.map((row, index) => <Cell key={row.name} fill={PALETTE[index % PALETTE.length]} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  }
+
   return (
-    <ResponsiveContainer width="99%" height="100%">
+    <ResponsiveContainer width="99%" height="100%" initialDimension={{ width: 500, height: 220 }}>
       <BarChart data={rows} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
         <XAxis
@@ -481,16 +556,6 @@ function ChartBody({ widget, rows }: { widget: Widget; rows: { name: string; val
 function WidgetEditor({
   widget, fields, onChange,
 }: { widget: Widget; fields: ModelFieldGroup[]; onChange: (patch: Partial<Widget>) => void }) {
-  const charts: { value: ChartType; label: string }[] = [
-    { value: 'bar', label: 'Bars' },
-    { value: 'line', label: 'Line' },
-    { value: 'area', label: 'Area' },
-    { value: 'pie', label: 'Donut' },
-    { value: 'scatter', label: 'Scatter' },
-    { value: 'table', label: 'Table' },
-    { value: 'kpi', label: 'Single number' },
-  ];
-
   const aggregations: Aggregation[] = ['sum', 'avg', 'median', 'min', 'max', 'count', 'count_distinct'];
 
   const encode = (tableId: number, column: string) => `${tableId}::${column}`;
@@ -505,10 +570,12 @@ function WidgetEditor({
         <span className="text-[9px] font-bold text-gray-500 uppercase">Chart</span>
         <select
           value={widget.chart}
-          onChange={(e) => onChange({ chart: e.target.value as ChartType })}
+          onChange={(e) => onChange({ chart: e.target.value as CustomChartType })}
           className="w-full glass-input text-[10px] py-1"
         >
-          {charts.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+          {CUSTOM_CHART_OPTIONS.map((chart) => (
+            <option key={chart.value} value={chart.value}>{chart.label}</option>
+          ))}
         </select>
       </label>
 

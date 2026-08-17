@@ -6,6 +6,7 @@ import {
   Loader2, Plus, ShieldCheck, Sigma, Table2, Trash2,
 } from 'lucide-react';
 
+import AutoDashboard from '../components/AutoDashboard';
 import CleanModule from '../components/CleanModule';
 import DashboardBuilder from '../components/DashboardBuilder';
 import DataGrid from '../components/DataGrid';
@@ -426,7 +427,15 @@ export default function Home() {
               )}
 
               {screen === 'dashboard' && model && (
-                <DashboardBuilder projectId={project.id} model={model} />
+                <div className="space-y-4">
+                  <AutoDashboard
+                    projectId={project.id}
+                    model={model}
+                    tables={tables}
+                    onOpenTable={(id) => { void openTable(project.id, id); setScreen('data'); }}
+                  />
+                  <DashboardBuilder projectId={project.id} model={model} />
+                </div>
               )}
 
               {screen === 'report' && table && model && (
