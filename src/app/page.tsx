@@ -10,6 +10,7 @@ import AutoDashboard from '../components/AutoDashboard';
 import CleanModule from '../components/CleanModule';
 import DashboardBuilder from '../components/DashboardBuilder';
 import DataGrid from '../components/DataGrid';
+import Dialog, { type DialogRequest } from '../components/Dialog';
 import OverviewModule from '../components/OverviewModule';
 import ReportGenerator from '../components/ReportGenerator';
 import SemanticModelModule from '../components/SemanticModelModule';
@@ -58,6 +59,9 @@ export default function Home() {
   const [screen, setScreenState] = useState<Screen>(() => screenFromHash() ?? 'sources');
   const [booting, setBooting] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Naming and confirmation both go through an in-app dialog: native
+  // `window.prompt`/`confirm` are missing in embedded browsers.
+  const [dialog, setDialog] = useState<DialogRequest | null>(null);
 
   const setScreen = useCallback((next: Screen) => {
     setScreenState(next);
@@ -141,19 +145,24 @@ export default function Home() {
 
   /* ── Actions ─────────────────────────────────────────────────────────── */
 
-  const createProject = async () => {
-    const name = window.prompt('Name this project', `Analysis ${projects.length + 1}`);
-    if (!name?.trim()) return;
-    try {
-      const created = await api.createProject(name.trim());
-      await loadProjects();
-      setTable(null);
-      setModel(null);
-      await openProject(created.id);
-      setScreen('sources');
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Could not create the project.');
-    }
+  const createProject = () => {
+    setDialog({
+      title: 'Name this project',
+      defaultValue: `Analysis ${projects.length + 1}`,
+      confirmLabel: 'Create',
+      onConfirm: async (name) => {
+        try {
+          const created = await api.createProject(name);
+          await loadProjects();
+          setTable(null);
+          setModel(null);
+          await openProject(created.id);
+          setScreen('sources');
+        } catch (cause) {
+          setError(cause instanceof ApiError ? cause.message : 'Could not create the project.');
+        }
+      },
+    });
   };
 
   const handleUploaded = async (result: UploadResult) => {
@@ -163,32 +172,46 @@ export default function Home() {
     if (result.tables.length > 0) setScreen('overview');
   };
 
-  const handleDeleteTable = async (tableId: number) => {
+  const handleDeleteTable = (tableId: number) => {
     if (!project) return;
-    if (!window.confirm('Remove this table and everything derived from it?')) return;
-    try {
-      await api.deleteTable(project.id, tableId);
-      const remaining = project.tables.filter((t) => t.id !== tableId);
-      await openProject(project.id, remaining[0]?.id);
-      await loadProjects();
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Could not remove the table.');
-    }
+    setDialog({
+      title: 'Remove this table?',
+      body: 'The table and everything derived from it will be deleted.',
+      confirmLabel: 'Remove',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteTable(project.id, tableId);
+          const remaining = project.tables.filter((t) => t.id !== tableId);
+          await openProject(project.id, remaining[0]?.id);
+          await loadProjects();
+        } catch (cause) {
+          setError(cause instanceof ApiError ? cause.message : 'Could not remove the table.');
+        }
+      },
+    });
   };
 
-  const handleDeleteProject = async (projectId: number) => {
-    if (!window.confirm('Delete this project and all of its data?')) return;
-    try {
-      await api.deleteProject(projectId);
-      const list = await loadProjects();
-      setProject(null);
-      setTable(null);
-      setModel(null);
-      if (list.length > 0) await openProject(list[0].id);
-      else setScreen('sources');
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Could not delete the project.');
-    }
+  const handleDeleteProject = (projectId: number) => {
+    setDialog({
+      title: 'Delete this project?',
+      body: 'The project and all of its data will be deleted.',
+      confirmLabel: 'Delete',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteProject(projectId);
+          const list = await loadProjects();
+          setProject(null);
+          setTable(null);
+          setModel(null);
+          if (list.length > 0) await openProject(list[0].id);
+          else setScreen('sources');
+        } catch (cause) {
+          setError(cause instanceof ApiError ? cause.message : 'Could not delete the project.');
+        }
+      },
+    });
   };
 
   const handleTableChanged = async (updated: TableDetail) => {
@@ -445,6 +468,8 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      {dialog && <Dialog request={dialog} onClose={() => setDialog(null)} />}
     </div>
   );
 }

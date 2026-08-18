@@ -1,15 +1,24 @@
+# Core API
 fastapi
-uvicorn
-pandas
-numpy
-scipy
+uvicorn[standard]
+pydantic>=2
 python-multipart
+
+# Analysis engine. DuckDB does all the profiling, joins and aggregation in SQL,
+# which is what lets a 150 MB file be analysed without loading it into memory.
+duckdb>=1.1
+
+# Excel reading only. pandas is not used for analysis, just to turn a worksheet
+# into something DuckDB can ingest.
+pandas
 openpyxl
-pydantic
+
+# Metadata storage (projects, tables, relationships, operation history)
 sqlalchemy
 psycopg2-binary
+
+# Auth. Only required once GOOGLE_CLIENT_ID and JWT_SECRET are configured.
 google-auth
-google-auth-oauthlib
-google-auth-httplib2
 python-jose[cryptography]
+
 python-dotenv
