@@ -397,3 +397,11 @@ export interface HealthInfo {
   auth_note: string;
   max_upload_mb: number;
 }
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string | null;
+  picture: string | null;
+  is_guest: boolean;
+}

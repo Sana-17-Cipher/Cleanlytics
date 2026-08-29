@@ -17,8 +17,9 @@ openpyxl
 sqlalchemy
 psycopg2-binary
 
-# Auth. Only required once GOOGLE_CLIENT_ID and JWT_SECRET are configured.
+# Auth. python-jose is kept for backward compat; PyJWT is used for Supabase JWT verification.
 google-auth
 python-jose[cryptography]
+PyJWT
 
 python-dotenv

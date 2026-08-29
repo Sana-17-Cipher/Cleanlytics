@@ -3,8 +3,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle, Database, FileSpreadsheet, Grid, Layers, LayoutDashboard,
-  Loader2, Plus, ShieldCheck, Sigma, Table2, Trash2,
+  Loader2, LogOut, Plus, ShieldCheck, Sigma, Table2, Trash2,
 } from 'lucide-react';
+import { useAuth } from '../components/AuthProvider';
 
 import AutoDashboard from '../components/AutoDashboard';
 import CleanModule from '../components/CleanModule';
@@ -48,6 +49,7 @@ const NAV: { id: Screen; label: string; icon: typeof Database; needsTable: boole
 ];
 
 export default function Home() {
+  const { user, signOut } = useAuth();
   const [health, setHealth] = useState<HealthInfo | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -120,7 +122,7 @@ export default function Home() {
         setScreen('sources');
       }
     },
-    [loadModel, openTable],
+    [loadModel, openTable, setScreen],
   );
 
   // Initial load: pick up the most recent project so a reload lands where the
@@ -358,7 +360,22 @@ export default function Home() {
             ))}
           </div>
 
-          {health && !health.auth_enabled && (
+          {user && (
+            <div className="flex items-center gap-2 pt-1 border-t border-gray-900">
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] text-gray-400 truncate">{user.email}</p>
+              </div>
+              <button
+                onClick={() => void signOut()}
+                className="text-gray-600 hover:text-red-400 transition shrink-0"
+                aria-label="Sign out"
+                title="Sign out"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {!user && health && !health.auth_enabled && (
             <p className="text-[9px] text-gray-600 leading-snug pt-1 border-t border-gray-900">
               Local workspace. Sign-in is off until it is configured.
             </p>

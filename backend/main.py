@@ -33,10 +33,14 @@ from models import DataTable, Dashboard, OperationLog, Project, TableRelationshi
 
 load_dotenv()
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 JWT_ALGORITHM = "HS256"
 TOKEN_TTL = timedelta(days=7)
+
+
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -44,10 +48,11 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-# Sign-in is only enforced once both halves are configured. Until then the app
-# runs against a single local workspace, which is stated plainly in /api/health
-# rather than being dressed up as a logged-in session.
-AUTH_ENABLED = bool(GOOGLE_CLIENT_ID and JWT_SECRET)
+# Sign-in is enforced when EITHER Supabase JWT secret OR Google+JWT are configured.
+# Supabase auth is preferred when its secret is set.
+AUTH_ENABLED = bool(
+    SUPABASE_URL or (GOOGLE_CLIENT_ID and JWT_SECRET)
+)
 
 GUEST_GOOGLE_ID = "local-workspace"
 
@@ -110,11 +115,14 @@ def current_user(
     """
     Resolve the caller.
 
-    The previous version accepted an Authorization header and then ignored it
-    completely, always returning user 1, so every project belonged to everyone
-    and the sign-in flow was decorative. Here the token is actually verified,
-    and when sign-in is not configured the shared local workspace is used
-    openly instead of being faked.
+    Supports two auth modes:
+    1. Supabase JWT (preferred): verified via SUPABASE_JWT_SECRET using PyJWT.
+       The Supabase `sub` (user UUID) is mapped to a local User row, creating
+       one on first contact.
+    2. Legacy internal JWT: verified via JWT_SECRET using python-jose.
+       Kept for backward compatibility.
+
+    When neither is configured, a shared local workspace is used openly.
     """
     if not AUTH_ENABLED:
         return _ensure_guest(db)
@@ -122,9 +130,84 @@ def current_user(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Sign in to continue.")
 
+    token = authorization.split(" ", 1)[1].strip()
+
+     # ── Supabase JWT path ────────────────────────────────────────────────
+    if SUPABASE_URL:
+        import jwt as pyjwt
+        from jwt import PyJWKClient
+
+        try:
+            # Supabase publishes the public signing keys for JWT verification.
+            jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+
+            jwk_client = PyJWKClient(jwks_url)
+            signing_key = jwk_client.get_signing_key_from_jwt(token)
+
+            payload = pyjwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["ES256"],
+                audience="authenticated",
+                issuer=f"{SUPABASE_URL}/auth/v1",
+            )
+
+        except pyjwt.ExpiredSignatureError:
+            raise HTTPException(
+                status_code=401,
+                detail="Your session has expired. Sign in again.",
+            )
+
+        except pyjwt.InvalidTokenError as exc:
+            print(
+                f"[AUTH DEBUG] Supabase JWT verification failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication token.",
+            )
+
+        except Exception as exc:
+            print(
+                f"[AUTH DEBUG] Supabase JWKS verification failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Unable to verify authentication token.",
+            )
+
+        supabase_uid = payload.get("sub", "")
+        email = payload.get("email", "")
+
+        if not supabase_uid:
+            raise HTTPException(
+                status_code=401,
+                detail="Malformed token: missing subject.",
+            )
+
+        # Find or create the local user record keyed on the Supabase user ID.
+        user = db.query(User).filter(User.google_id == supabase_uid).first()
+
+        if user:
+            user.last_login = datetime.now(timezone.utc)
+            db.commit()
+        else:
+            user = User(
+                google_id=supabase_uid,
+                email=email,
+                name=email.split("@")[0] if email else "User",
+                is_guest=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        return user
+    # ── Legacy internal JWT path ─────────────────────────────────────────
     from jose import JWTError, jwt
 
-    token = authorization.split(" ", 1)[1].strip()
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except JWTError:

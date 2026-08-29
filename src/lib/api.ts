@@ -26,6 +26,18 @@ import type {
 
 const BASE = '/api';
 
+// ── Auth token management ───────────────────────────────────────────────────
+// The AuthProvider calls setToken whenever the Supabase session changes.
+let _accessToken: string | null = null;
+
+export function setToken(token: string | null) {
+  _accessToken = token;
+}
+
+export function getToken(): string | null {
+  return _accessToken;
+}
+
 /** Thrown for any non-2xx response, carrying the server's own explanation. */
 export class ApiError extends Error {
   readonly status: number;
@@ -40,7 +52,11 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${BASE}${path}`, init);
+    const headers = new Headers(init?.headers);
+    if (_accessToken) {
+      headers.set('Authorization', `Bearer ${_accessToken}`);
+    }
+    response = await fetch(`${BASE}${path}`, { ...init, headers });
   } catch {
     throw new ApiError(
       'Could not reach the analysis service. Check that the backend is running.',
@@ -108,6 +124,9 @@ export const api = {
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', `${BASE}/projects/${projectId}/tables`);
+      if (_accessToken) {
+        xhr.setRequestHeader('Authorization', `Bearer ${_accessToken}`);
+      }
 
       xhr.upload.addEventListener('progress', (event) => {
         if (onProgress && event.lengthComputable) {
