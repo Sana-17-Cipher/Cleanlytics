@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import AuthShell from "../components/AuthShell";
 
 export const metadata: Metadata = {
   title: "CLEANYTICS | Multi-Table Data Analytics Workspace",
@@ -16,7 +17,9 @@ export default function RootLayout({
       lang="en"
       className="h-full antialiased"
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        <AuthShell>{children}</AuthShell>
+      </body>
     </html>
   );
 }
