@@ -272,7 +272,11 @@ function ColumnRow({
           </div>
 
           {/* Numeric spread */}
-          {isNumeric && stats.q1 != null && stats.q3 != null && (
+          {isNumeric &&
+  typeof stats.min === 'number' &&
+  typeof stats.max === 'number' &&
+  stats.q1 != null &&
+  stats.q3 != null && (
             <div className="space-y-1.5">
               <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Spread</p>
               <Spread

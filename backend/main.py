@@ -1,14 +1,13 @@
 """
 CLEANYTICS API.
 
-Rows never travel through this layer in bulk. Uploads stream to disk and go
-straight into DuckDB; everything the client receives afterwards is either a
-bounded page of rows or an aggregate. That is what keeps a 100 MB file workable
-end to end.
+Uploaded rows live in DuckDB. This API handles authentication, project
+metadata, uploads, cleaning, relationships, queries, and dashboards.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
@@ -17,7 +16,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -29,27 +37,36 @@ from analysis import model as model_engine
 from analysis import operations, quality, relationships
 from analysis.profiler import profile_table
 from database import Base, SessionLocal, engine, get_db
-from models import DataTable, Dashboard, OperationLog, Project, TableRelationship, User
+from models import (
+    DataTable,
+    Dashboard,
+    OperationLog,
+    Project,
+    TableRelationship,
+    User,
+)
+
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+
 JWT_ALGORITHM = "HS256"
 TOKEN_TTL = timedelta(days=7)
 
-
-
 ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
     if origin.strip()
 ]
 
-# Sign-in is enforced when EITHER Supabase JWT secret OR Google+JWT are configured.
-# Supabase auth is preferred when its secret is set.
 AUTH_ENABLED = bool(
     SUPABASE_URL or (GOOGLE_CLIENT_ID and JWT_SECRET)
 )
@@ -60,16 +77,22 @@ GUEST_GOOGLE_ID = "local-workspace"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+
     if not AUTH_ENABLED:
         db = SessionLocal()
         try:
             _ensure_guest(db)
         finally:
             db.close()
+
     yield
 
 
-app = FastAPI(title="CLEANYTICS API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="CLEANYTICS API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -84,7 +107,12 @@ app.add_middleware(
 
 
 def _ensure_guest(db: Session) -> User:
-    guest = db.query(User).filter(User.google_id == GUEST_GOOGLE_ID).first()
+    guest = (
+        db.query(User)
+        .filter(User.google_id == GUEST_GOOGLE_ID)
+        .first()
+    )
+
     if not guest:
         guest = User(
             google_id=GUEST_GOOGLE_ID,
@@ -95,6 +123,7 @@ def _ensure_guest(db: Session) -> User:
         db.add(guest)
         db.commit()
         db.refresh(guest)
+
     return guest
 
 
@@ -106,41 +135,41 @@ def create_access_token(user: User) -> str:
         "email": user.email,
         "exp": datetime.now(timezone.utc) + TOKEN_TTL,
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
 
 
 def current_user(
-    authorization: Optional[str] = Header(None), db: Session = Depends(get_db)
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
 ) -> User:
-    """
-    Resolve the caller.
-
-    Supports two auth modes:
-    1. Supabase JWT (preferred): verified via SUPABASE_JWT_SECRET using PyJWT.
-       The Supabase `sub` (user UUID) is mapped to a local User row, creating
-       one on first contact.
-    2. Legacy internal JWT: verified via JWT_SECRET using python-jose.
-       Kept for backward compatibility.
-
-    When neither is configured, a shared local workspace is used openly.
-    """
+    """Resolve the authenticated user or the local guest workspace."""
     if not AUTH_ENABLED:
         return _ensure_guest(db)
 
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    if (
+        not authorization
+        or not authorization.lower().startswith("bearer ")
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Sign in to continue.",
+        )
 
     token = authorization.split(" ", 1)[1].strip()
 
-     # ── Supabase JWT path ────────────────────────────────────────────────
     if SUPABASE_URL:
         import jwt as pyjwt
         from jwt import PyJWKClient
 
         try:
-            # Supabase publishes the public signing keys for JWT verification.
-            jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-
+            jwks_url = (
+                f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+            )
             jwk_client = PyJWKClient(jwks_url)
             signing_key = jwk_client.get_signing_key_from_jwt(token)
 
@@ -160,7 +189,7 @@ def current_user(
 
         except pyjwt.InvalidTokenError as exc:
             print(
-                f"[AUTH DEBUG] Supabase JWT verification failed: "
+                "[AUTH DEBUG] Supabase JWT verification failed: "
                 f"{type(exc).__name__}: {exc}"
             )
             raise HTTPException(
@@ -170,7 +199,7 @@ def current_user(
 
         except Exception as exc:
             print(
-                f"[AUTH DEBUG] Supabase JWKS verification failed: "
+                "[AUTH DEBUG] Supabase JWKS verification failed: "
                 f"{type(exc).__name__}: {exc}"
             )
             raise HTTPException(
@@ -187,8 +216,11 @@ def current_user(
                 detail="Malformed token: missing subject.",
             )
 
-        # Find or create the local user record keyed on the Supabase user ID.
-        user = db.query(User).filter(User.google_id == supabase_uid).first()
+        user = (
+            db.query(User)
+            .filter(User.google_id == supabase_uid)
+            .first()
+        )
 
         if user:
             user.last_login = datetime.now(timezone.utc)
@@ -205,46 +237,79 @@ def current_user(
             db.refresh(user)
 
         return user
-    # ── Legacy internal JWT path ─────────────────────────────────────────
+
     from jose import JWTError, jwt
 
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
     except JWTError:
-        raise HTTPException(status_code=401, detail="Your session has expired. Sign in again.")
+        raise HTTPException(
+            status_code=401,
+            detail="Your session has expired. Sign in again.",
+        )
 
-    user = db.query(User).filter(User.id == int(payload.get("sub", 0))).first()
+    user = (
+        db.query(User)
+        .filter(User.id == int(payload.get("sub", 0)))
+        .first()
+    )
+
     if not user:
-        raise HTTPException(status_code=401, detail="This account no longer exists.")
+        raise HTTPException(
+            status_code=401,
+            detail="This account no longer exists.",
+        )
+
     return user
 
 
-def owned_project(project_id: int, db: Session, user: User) -> Project:
-    """
-    Fetch a project the caller owns.
-
-    Every project-scoped route goes through this. Previously only a handful of
-    endpoints checked ownership at all, so table and relationship routes would
-    happily serve another user's data as soon as sign-in started working.
-    """
+def owned_project(
+    project_id: int,
+    db: Session,
+    user: User,
+) -> Project:
     project = (
         db.query(Project)
-        .filter(Project.id == project_id, Project.user_id == user.id)
+        .filter(
+            Project.id == project_id,
+            Project.user_id == user.id,
+        )
         .first()
     )
+
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found.",
+        )
+
     return project
 
 
-def owned_table(project: Project, table_id: int, db: Session) -> DataTable:
+def owned_table(
+    project: Project,
+    table_id: int,
+    db: Session,
+) -> DataTable:
     table = (
         db.query(DataTable)
-        .filter(DataTable.id == table_id, DataTable.project_id == project.id)
+        .filter(
+            DataTable.id == table_id,
+            DataTable.project_id == project.id,
+        )
         .first()
     )
+
     if not table:
-        raise HTTPException(status_code=404, detail="Table not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Table not found.",
+        )
+
     return table
 
 
@@ -253,6 +318,7 @@ def owned_table(project: Project, table_id: int, db: Session) -> DataTable:
 
 def table_summary(table: DataTable) -> Dict[str, Any]:
     profile = table.profile or {}
+
     return {
         "id": table.id,
         "table_name": table.table_name,
@@ -262,36 +328,54 @@ def table_summary(table: DataTable) -> Dict[str, Any]:
         "column_count": table.column_count,
         "columns": [
             {
-                "name": c["name"],
-                "logical_type": c["logical_type"],
-                "semantic_role": c["semantic_role"],
-                "subtype": c.get("subtype"),
-                "default_aggregation": c.get("default_aggregation"),
-                "additivity": c.get("additivity"),
-                "null_ratio": c.get("null_ratio"),
-                "distinct_count": c.get("distinct_count"),
-                "is_unique": c.get("is_unique"),
+                "name": column["name"],
+                "logical_type": column["logical_type"],
+                "semantic_role": column["semantic_role"],
+                "subtype": column.get("subtype"),
+                "default_aggregation": column.get("default_aggregation"),
+                "additivity": column.get("additivity"),
+                "null_ratio": column.get("null_ratio"),
+                "distinct_count": column.get("distinct_count"),
+                "is_unique": column.get("is_unique"),
             }
-            for c in profile.get("columns", [])
+            for column in profile.get("columns", [])
         ],
         "summary": profile.get("summary"),
         "quality": table.quality,
-        "created_at": table.created_at.isoformat() if table.created_at else None,
-        "updated_at": table.updated_at.isoformat() if table.updated_at else None,
+        "created_at": (
+            table.created_at.isoformat()
+            if table.created_at else None
+        ),
+        "updated_at": (
+            table.updated_at.isoformat()
+            if table.updated_at else None
+        ),
     }
 
 
-def relationship_payload(rel: TableRelationship, names: Dict[int, str]) -> Dict[str, Any]:
+def relationship_payload(
+    rel: TableRelationship,
+    names: Dict[int, str],
+) -> Dict[str, Any]:
     return {
         "id": rel.id,
         "from_table_id": rel.from_table_id,
-        "from_table_name": names.get(rel.from_table_id, f"Table {rel.from_table_id}"),
+        "from_table_name": names.get(
+            rel.from_table_id,
+            f"Table {rel.from_table_id}",
+        ),
         "from_column": rel.from_column,
         "to_table_id": rel.to_table_id,
-        "to_table_name": names.get(rel.to_table_id, f"Table {rel.to_table_id}"),
+        "to_table_name": names.get(
+            rel.to_table_id,
+            f"Table {rel.to_table_id}",
+        ),
         "to_column": rel.to_column,
         "cardinality": rel.cardinality,
-        "cardinality_label": relationships.CARDINALITY_LABEL.get(rel.cardinality, rel.cardinality),
+        "cardinality_label": relationships.CARDINALITY_LABEL.get(
+            rel.cardinality,
+            rel.cardinality,
+        ),
         "confidence": rel.confidence,
         "coverage": rel.coverage,
         "status": rel.status,
@@ -301,31 +385,53 @@ def relationship_payload(rel: TableRelationship, names: Dict[int, str]) -> Dict[
     }
 
 
-def model_tables(project: Project, db: Session) -> List[Dict[str, Any]]:
-    """Shape a project's tables the way the analysis engine expects."""
-    rows = db.query(DataTable).filter(DataTable.project_id == project.id).order_by(DataTable.id).all()
+def model_tables(
+    project: Project,
+    db: Session,
+) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(DataTable)
+        .filter(DataTable.project_id == project.id)
+        .order_by(DataTable.id)
+        .all()
+    )
+
     return [
         {
-            "id": t.id,
-            "table_name": t.table_name,
-            "physical_name": t.physical_name,
-            "row_count": t.row_count,
-            "profile": t.profile or {},
+            "id": table.id,
+            "table_name": table.table_name,
+            "physical_name": table.physical_name,
+            "row_count": table.row_count,
+            "profile": table.profile or {},
         }
-        for t in rows
+        for table in rows
     ]
 
 
-def refresh_analysis(table: DataTable, db: Session) -> None:
-    """Recompute and store the profile and quality findings for one table."""
-    profile = profile_table(table.project_id, table.physical_name)
-    table.profile = profile
+def refresh_analysis(
+    table: DataTable,
+    db: Session,
+    *,
+    commit: bool = True,
+) -> None:
+    """Recompute the profile and quality findings for one table."""
+    profile = profile_table(
+        table.project_id,
+        table.physical_name,
+    )
     findings = quality.detect(profile)
-    table.quality = {"findings": findings, "summary": quality.summarise(findings)}
+
+    table.profile = profile
+    table.quality = {
+        "findings": findings,
+        "summary": quality.summarise(findings),
+    }
     table.row_count = int(profile["summary"]["rows"])
     table.column_count = int(profile["summary"]["columns"])
     table.profiled_at = datetime.now(timezone.utc)
-    db.commit()
+
+    if commit:
+        db.commit()
 
 
 # ─── Health ──────────────────────────────────────────────────────────────────
@@ -339,8 +445,11 @@ def health() -> Dict[str, Any]:
         "auth_note": (
             "Sign-in is active."
             if AUTH_ENABLED
-            else "Sign-in is not configured, so everything runs in one shared local workspace. "
-                 "Set GOOGLE_CLIENT_ID and JWT_SECRET to enable accounts."
+            else (
+                "Sign-in is not configured, so everything runs "
+                "in one shared local workspace. "
+                "Set GOOGLE_CLIENT_ID and JWT_SECRET to enable accounts."
+            )
         ),
         "max_upload_mb": store.MAX_UPLOAD_BYTES // (1024 * 1024),
     }
@@ -354,22 +463,40 @@ class GoogleToken(BaseModel):
 
 
 @app.post("/api/auth/google")
-def google_auth(payload: GoogleToken, db: Session = Depends(get_db)) -> Dict[str, Any]:
+def google_auth(
+    payload: GoogleToken,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     if not AUTH_ENABLED:
         raise HTTPException(
             status_code=503,
-            detail="Sign-in is not configured on this server. Set GOOGLE_CLIENT_ID and JWT_SECRET.",
+            detail=(
+                "Sign-in is not configured on this server. "
+                "Set GOOGLE_CLIENT_ID and JWT_SECRET."
+            ),
         )
 
     from google.auth.transport import requests as google_requests
     from google.oauth2 import id_token
 
     try:
-        info = id_token.verify_oauth2_token(payload.token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        info = id_token.verify_oauth2_token(
+            payload.token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=f"Google rejected that sign-in: {exc}") from exc
+        raise HTTPException(
+            status_code=401,
+            detail=f"Google rejected that sign-in: {exc}",
+        ) from exc
 
-    user = db.query(User).filter(User.google_id == info["sub"]).first()
+    user = (
+        db.query(User)
+        .filter(User.google_id == info["sub"])
+        .first()
+    )
+
     if user:
         user.name = info.get("name", user.name)
         user.picture = info.get("picture", user.picture)
@@ -382,17 +509,25 @@ def google_auth(payload: GoogleToken, db: Session = Depends(get_db)) -> Dict[str
             picture=info.get("picture"),
         )
         db.add(user)
+
     db.commit()
     db.refresh(user)
 
     return {
         "access_token": create_access_token(user),
-        "user": {"id": user.id, "name": user.name, "email": user.email, "picture": user.picture},
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "picture": user.picture,
+        },
     }
 
 
 @app.get("/api/auth/me")
-def me(user: User = Depends(current_user)) -> Dict[str, Any]:
+def me(
+    user: User = Depends(current_user),
+) -> Dict[str, Any]:
     return {
         "id": user.id,
         "name": user.name,
@@ -412,12 +547,19 @@ class ProjectCreate(BaseModel):
 
 @app.post("/api/projects")
 def create_project(
-    payload: ProjectCreate, db: Session = Depends(get_db), user: User = Depends(current_user)
+    payload: ProjectCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    project = Project(user_id=user.id, name=payload.name.strip(), description=payload.description)
+    project = Project(
+        user_id=user.id,
+        name=payload.name.strip(),
+        description=payload.description,
+    )
     db.add(project)
     db.commit()
     db.refresh(project)
+
     return {
         "id": project.id,
         "name": project.name,
@@ -429,67 +571,127 @@ def create_project(
 
 
 @app.get("/api/projects")
-def list_projects(db: Session = Depends(get_db), user: User = Depends(current_user)) -> List[Dict[str, Any]]:
+def list_projects(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> List[Dict[str, Any]]:
     projects = (
-        db.query(Project).filter(Project.user_id == user.id).order_by(Project.updated_at.desc()).all()
+        db.query(Project)
+        .filter(Project.user_id == user.id)
+        .order_by(Project.updated_at.desc())
+        .all()
     )
+
+    project_ids = [project.id for project in projects] or [0]
+
     stats = dict(
-        db.query(DataTable.project_id, func.count(DataTable.id))
-        .filter(DataTable.project_id.in_([p.id for p in projects] or [0]))
+        db.query(
+            DataTable.project_id,
+            func.count(DataTable.id),
+        )
+        .filter(DataTable.project_id.in_(project_ids))
         .group_by(DataTable.project_id)
         .all()
     )
+
     rows = dict(
-        db.query(DataTable.project_id, func.sum(DataTable.row_count))
-        .filter(DataTable.project_id.in_([p.id for p in projects] or [0]))
+        db.query(
+            DataTable.project_id,
+            func.sum(DataTable.row_count),
+        )
+        .filter(DataTable.project_id.in_(project_ids))
         .group_by(DataTable.project_id)
         .all()
     )
+
     return [
         {
-            "id": p.id,
-            "name": p.name,
-            "description": p.description,
-            "table_count": int(stats.get(p.id, 0)),
-            "row_count": int(rows.get(p.id, 0) or 0),
-            "created_at": p.created_at.isoformat(),
-            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "table_count": int(stats.get(project.id, 0)),
+            "row_count": int(rows.get(project.id, 0) or 0),
+            "created_at": project.created_at.isoformat(),
+            "updated_at": (
+                project.updated_at.isoformat()
+                if project.updated_at else None
+            ),
         }
-        for p in projects
+        for project in projects
     ]
 
 
 @app.get("/api/projects/{project_id}")
 def get_project(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
-    tables = db.query(DataTable).filter(DataTable.project_id == project.id).order_by(DataTable.id).all()
-    names = {t.id: t.table_name for t in tables}
-    rels = db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
+
+    tables = (
+        db.query(DataTable)
+        .filter(DataTable.project_id == project.id)
+        .order_by(DataTable.id)
+        .all()
+    )
+    names = {table.id: table.table_name for table in tables}
+
+    rels = (
+        db.query(TableRelationship)
+        .filter(TableRelationship.project_id == project.id)
+        .all()
+    )
 
     return {
         "id": project.id,
         "name": project.name,
         "description": project.description,
         "created_at": project.created_at.isoformat(),
-        "tables": [table_summary(t) for t in tables],
-        "relationships": [relationship_payload(r, names) for r in rels],
+        "tables": [table_summary(table) for table in tables],
+        "relationships": [
+            relationship_payload(rel, names)
+            for rel in rels
+        ],
     }
 
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, str]:
     project = owned_project(project_id, db, user)
     db.delete(project)
     db.commit()
+
     store.delete_project_data(project_id)
+
     return {"message": "Project deleted."}
 
 
 # ─── Upload ──────────────────────────────────────────────────────────────────
+
+
+def _remove_failed_import(
+    project_id: int,
+    physical_name: str,
+) -> None:
+    """Remove an unfinished import and any cleaning snapshots."""
+    with store.connect(project_id) as con:
+        con.execute("BEGIN TRANSACTION")
+
+        try:
+            operations.drop_snapshots(con, physical_name)
+            con.execute(
+                f"DROP TABLE IF EXISTS {store.q(physical_name)}"
+            )
+            con.execute("COMMIT")
+
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
 
 
 @app.post("/api/projects/{project_id}/tables")
@@ -497,110 +699,293 @@ async def upload_tables(
     project_id: int,
     files: List[UploadFile] = File(...),
     table_names: Optional[str] = Form(None),
+    auto_clean: bool = Form(True),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    """
-    Ingest one or more files into a project.
-
-    Each file becomes a table; each sheet of a workbook becomes its own table.
-    A failure on one file is reported against that file and the rest still load,
-    because losing four good uploads to one malformed CSV is needlessly hostile.
-    """
+    """Import, optionally clean, profile, then detect relationships."""
     project = owned_project(project_id, db, user)
-    requested_names = [n.strip() for n in (table_names or "").split("|")] if table_names else []
+
+    requested_names = (
+        [name.strip() for name in table_names.split("|")]
+        if table_names else []
+    )
 
     created: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
+    warnings: List[str] = []
+    cleaned_cells = 0
 
     existing_names = {
-        t.table_name.casefold()
-        for t in db.query(DataTable).filter(DataTable.project_id == project.id).all()
+        table.table_name.casefold()
+        for table in db.query(DataTable).filter(
+            DataTable.project_id == project.id
+        ).all()
     }
 
     for index, upload in enumerate(files):
         filename = upload.filename or f"upload_{index + 1}"
         saved: Optional[Path] = None
+
         try:
             saved = store.save_upload(upload.file, filename)
             sources = store.list_sources(saved, filename)
             byte_size = saved.stat().st_size
 
+            if not sources:
+                failed.append({
+                    "file": filename,
+                    "error": "No non-empty worksheets were found.",
+                })
+
             for source in sources:
-                preferred = (
-                    requested_names[index]
-                    if len(sources) == 1 and index < len(requested_names) and requested_names[index]
-                    else source["label"]
-                )
-                name = _unique_table_name(preferred, existing_names)
-                existing_names.add(name.casefold())
+                physical: Optional[str] = None
 
-                record = DataTable(
-                    project_id=project.id,
-                    table_name=name,
-                    source_file=filename,
-                    source_sheet=source["sheet"],
-                    physical_name="pending",
-                    byte_size=byte_size,
-                )
-                db.add(record)
-                db.flush()  # assigns the id used for the physical table name
-                record.physical_name = store.physical_name(record.id)
+                try:
+                    preferred = (
+                        requested_names[index]
+                        if len(sources) == 1
+                        and index < len(requested_names)
+                        and requested_names[index]
+                        else source["label"]
+                    )
 
-                info = store.ingest(project.id, record.id, saved, filename, source["sheet"])
-                record.row_count = info["row_count"]
-                record.column_count = len(info["columns"])
-                db.commit()
-                db.refresh(record)
+                    name = _unique_table_name(
+                        preferred,
+                        existing_names,
+                    )
 
-                refresh_analysis(record, db)
-                created.append(table_summary(record))
+                    record = DataTable(
+                        project_id=project_id,
+                        table_name=name,
+                        source_file=filename,
+                        source_sheet=source["sheet"],
+                        physical_name="pending",
+                        byte_size=byte_size,
+                    )
+                    db.add(record)
+                    db.flush()
+
+                    physical = store.physical_name(record.id)
+                    record.physical_name = physical
+
+                    info = store.ingest(
+                        project_id,
+                        record.id,
+                        saved,
+                        filename,
+                        source["sheet"],
+                    )
+                    record.row_count = info["row_count"]
+                    record.column_count = len(info["columns"])
+
+                    cleaning = None
+
+                    if auto_clean:
+                        cleaning = operations.apply_operation(
+                            project_id,
+                            physical,
+                            "auto_clean",
+                            {},
+                        )
+
+                        db.add(
+                            OperationLog(
+                                table_id=record.id,
+                                operation="auto_clean",
+                                params={},
+                                description=cleaning["description"],
+                                rows_before=cleaning["rows_before"],
+                                rows_after=cleaning["rows_after"],
+                                destructive=cleaning["destructive"],
+                            )
+                        )
+
+                    # Analyse the cleaned data before detecting relationships.
+                    refresh_analysis(record, db, commit=False)
+                    project.updated_at = datetime.now(timezone.utc)
+
+                    db.flush()
+                    summary = table_summary(record)
+                    db.commit()
+
+                    created.append(summary)
+                    existing_names.add(name.casefold())
+
+                    if cleaning:
+                        cleaned_cells += cleaning["cells_changed"]
+
+                except Exception as exc:
+                    db.rollback()
+
+                    if physical:
+                        try:
+                            _remove_failed_import(
+                                project_id,
+                                physical,
+                            )
+                        except Exception as cleanup_exc:
+                            logger.exception(
+                                "Could not remove an unfinished import"
+                            )
+                            raise HTTPException(
+                                status_code=500,
+                                detail=(
+                                    "An import failed and its temporary "
+                                    "data could not be removed. Some "
+                                    "earlier tables may have loaded. "
+                                    "Check the project before retrying."
+                                ),
+                            ) from cleanup_exc
+
+                    label = (
+                        f"{filename} [{source['sheet']}]"
+                        if source["sheet"] else filename
+                    )
+
+                    if isinstance(
+                        exc,
+                        (store.StoreError, operations.OperationError),
+                    ):
+                        detail = str(exc)
+                    else:
+                        logger.exception(
+                            "Import failed for %s",
+                            label,
+                        )
+                        detail = (
+                            "This table could not be imported or "
+                            "analysed. Check the server log."
+                        )
+
+                    failed.append({
+                        "file": label,
+                        "error": detail,
+                    })
+
+        except HTTPException:
+            raise
+
         except store.StoreError as exc:
             db.rollback()
-            failed.append({"file": filename, "error": str(exc)})
-        except Exception as exc:  # noqa: BLE001 - surfaced to the user verbatim
+            failed.append({
+                "file": filename,
+                "error": str(exc),
+            })
+
+        except Exception:
             db.rollback()
-            failed.append({"file": filename, "error": f"Unexpected problem reading this file: {exc}"})
+            logger.exception(
+                "Could not read upload %s",
+                filename,
+            )
+            failed.append({
+                "file": filename,
+                "error": (
+                    "This file could not be read. "
+                    "Check the server log."
+                ),
+            })
+
         finally:
             if saved:
                 store.discard_upload(saved)
+
             await upload.close()
 
     detected: List[Dict[str, Any]] = []
+
     if created:
-        detected = _detect_and_store(project, db)
+        try:
+            detected = _detect_and_store(project, db)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Relationship detection failed for project %s",
+                project_id,
+            )
+            warnings.append(
+                "Your tables were saved, but relationship detection "
+                "failed. Retry detection from the data model; "
+                "do not upload these files again."
+            )
+
+    message = _upload_message(created, failed, detected)
+
+    if auto_clean and created:
+        message += (
+            f" Automatic cleaning updated {cleaned_cells:,} text cells."
+            if cleaned_cells
+            else " Automatic cleaning found no text changes to make."
+        )
+
+    if warnings:
+        message += " " + " ".join(warnings)
 
     return {
         "tables": created,
         "failed": failed,
         "relationships": detected,
-        "message": _upload_message(created, failed, detected),
+        "message": message,
+        "warnings": warnings,
     }
 
 
-def _unique_table_name(preferred: str, taken: set) -> str:
+def _unique_table_name(
+    preferred: str,
+    taken: set,
+) -> str:
     base = (preferred or "Table").strip() or "Table"
+
     if base.casefold() not in taken:
         return base
+
     index = 2
     while f"{base} {index}".casefold() in taken:
         index += 1
+
     return f"{base} {index}"
 
 
-def _upload_message(created: List, failed: List, detected: List) -> str:
+def _upload_message(
+    created: List,
+    failed: List,
+    detected: List,
+) -> str:
     parts = []
+
     if created:
-        parts.append(f"Loaded {len(created)} table{'s' if len(created) != 1 else ''}.")
+        suffix = "s" if len(created) != 1 else ""
+        parts.append(f"Loaded {len(created)} table{suffix}.")
+
     if detected:
-        auto = len([r for r in detected if r["status"] == "approved"])
+        auto = len([
+            rel for rel in detected
+            if rel["status"] == "approved"
+        ])
+
         if auto:
-            parts.append(f"Linked {auto} relationship{'s' if auto != 1 else ''} automatically.")
-        pending = len(detected) - auto
+            suffix = "s" if auto != 1 else ""
+            parts.append(
+                f"Linked {auto} relationship{suffix} automatically."
+            )
+
+        pending = len([
+            rel for rel in detected
+            if rel["status"] == "suggested"
+        ])
+
         if pending:
-            parts.append(f"{pending} more need{'s' if pending == 1 else ''} your confirmation.")
+            suffix = "s" if pending == 1 else ""
+            parts.append(
+                f"{pending} more need{suffix} your confirmation."
+            )
+
     if failed:
-        parts.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} could not be read.")
+        parts.append(
+            f"{len(failed)} file or worksheet import(s) failed."
+        )
+
     return " ".join(parts) or "Nothing was loaded."
 
 
@@ -609,21 +994,35 @@ def _upload_message(created: List, failed: List, detected: List) -> str:
 
 @app.get("/api/projects/{project_id}/tables")
 def list_tables(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> List[Dict[str, Any]]:
     project = owned_project(project_id, db, user)
-    tables = db.query(DataTable).filter(DataTable.project_id == project.id).order_by(DataTable.id).all()
-    return [table_summary(t) for t in tables]
+
+    tables = (
+        db.query(DataTable)
+        .filter(DataTable.project_id == project.id)
+        .order_by(DataTable.id)
+        .all()
+    )
+
+    return [table_summary(table) for table in tables]
 
 
 @app.get("/api/projects/{project_id}/tables/{table_id}")
 def get_table(
-    project_id: int, table_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
+
     payload = table_summary(table)
     payload["profile"] = table.profile
+
     return payload
 
 
@@ -639,9 +1038,9 @@ def get_rows(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    """A bounded page of rows. The only route that returns raw data."""
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
+
     try:
         return store.page_rows(
             project.id,
@@ -653,36 +1052,48 @@ def get_rows(
             search=search,
         )
     except store.StoreError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
 
 
 @app.delete("/api/projects/{project_id}/tables/{table_id}")
 def delete_table(
-    project_id: int, table_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, str]:
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
     physical = table.physical_name
 
-    # Relationships referencing this table go with it. The database cascade
-    # handles it, but doing it explicitly keeps behaviour identical on backends
-    # where cascades are not enforced.
     db.query(TableRelationship).filter(
-        (TableRelationship.from_table_id == table.id) | (TableRelationship.to_table_id == table.id)
+        (TableRelationship.from_table_id == table.id)
+        | (TableRelationship.to_table_id == table.id)
     ).delete(synchronize_session=False)
+
     db.delete(table)
     db.commit()
+
     store.drop_table(project.id, physical)
+
     return {"message": "Table removed."}
 
 
 @app.post("/api/projects/{project_id}/tables/{table_id}/reprofile")
 def reprofile(
-    project_id: int, table_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
+
     refresh_analysis(table, db)
+
     return get_table(project_id, table_id, db, user)
 
 
@@ -702,19 +1113,21 @@ def run_operation(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    """
-    Apply one change to a table and re-analyse it.
-
-    The description in the response is produced by the operation after it ran,
-    so it reports what actually happened rather than what was intended.
-    """
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
 
     try:
-        result = operations.apply_operation(project.id, table.physical_name, payload.operation, payload.params)
+        result = operations.apply_operation(
+            project.id,
+            table.physical_name,
+            payload.operation,
+            payload.params,
+        )
     except operations.OperationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
     db.add(
         OperationLog(
@@ -730,19 +1143,33 @@ def run_operation(
     db.commit()
 
     refresh_analysis(table, db)
-    return {"result": result, "table": get_table(project_id, table_id, db, user)}
+
+    return {
+        "result": result,
+        "table": get_table(project_id, table_id, db, user),
+    }
 
 
 @app.post("/api/projects/{project_id}/tables/{table_id}/undo")
 def undo_operation(
-    project_id: int, table_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
+
     try:
-        outcome = operations.undo_last(project.id, table.physical_name)
+        outcome = operations.undo_last(
+            project.id,
+            table.physical_name,
+        )
     except operations.OperationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
     last = (
         db.query(OperationLog)
@@ -750,12 +1177,15 @@ def undo_operation(
         .order_by(OperationLog.id.desc())
         .first()
     )
+
     reverted = last.description if last else None
+
     if last:
         db.delete(last)
         db.commit()
 
     refresh_analysis(table, db)
+
     return {
         "reverted": reverted,
         "undo_steps_remaining": outcome["undo_steps_remaining"],
@@ -765,10 +1195,14 @@ def undo_operation(
 
 @app.get("/api/projects/{project_id}/tables/{table_id}/history")
 def operation_history(
-    project_id: int, table_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    table_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> List[Dict[str, Any]]:
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
+
     entries = (
         db.query(OperationLog)
         .filter(OperationLog.table_id == table.id)
@@ -776,17 +1210,21 @@ def operation_history(
         .limit(100)
         .all()
     )
+
     return [
         {
-            "id": e.id,
-            "operation": e.operation,
-            "description": e.description,
-            "rows_before": e.rows_before,
-            "rows_after": e.rows_after,
-            "destructive": e.destructive,
-            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "id": entry.id,
+            "operation": entry.operation,
+            "description": entry.description,
+            "rows_before": entry.rows_before,
+            "rows_after": entry.rows_after,
+            "destructive": entry.destructive,
+            "created_at": (
+                entry.created_at.isoformat()
+                if entry.created_at else None
+            ),
         }
-        for e in entries
+        for entry in entries
     ]
 
 
@@ -798,24 +1236,51 @@ def export_table(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
-    """Export a whole table. DuckDB streams it to disk so size is not a factor."""
     project = owned_project(project_id, db, user)
     table = owned_table(project, table_id, db)
 
-    suffix = {"csv": ".csv", "xlsx": ".xlsx", "json": ".json", "parquet": ".parquet"}.get(format.lower())
-    if not suffix:
-        raise HTTPException(status_code=400, detail=f"Cannot export as '{format}'.")
+    suffix = {
+        "csv": ".csv",
+        "xlsx": ".xlsx",
+        "json": ".json",
+        "parquet": ".parquet",
+    }.get(format.lower())
 
-    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    if not suffix:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot export as '{format}'.",
+        )
+
+    handle = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix,
+    )
     handle.close()
     destination = Path(handle.name)
+
     try:
-        store.export_query(project.id, table.physical_name, format.lower(), destination)
+        store.export_query(
+            project.id,
+            table.physical_name,
+            format.lower(),
+            destination,
+        )
     except store.StoreError as exc:
         destination.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
-    safe = "".join(ch for ch in table.table_name if ch.isalnum() or ch in " _-").strip() or "table"
+    safe = (
+        "".join(
+            char for char in table.table_name
+            if char.isalnum() or char in " _-"
+        ).strip()
+        or "table"
+    )
+
     return FileResponse(
         destination,
         filename=f"{safe}{suffix}",
@@ -827,32 +1292,40 @@ def export_table(
 # ─── Relationships ───────────────────────────────────────────────────────────
 
 
-def _detect_and_store(project: Project, db: Session) -> List[Dict[str, Any]]:
-    """
-    Run detection and merge results with what is already recorded.
-
-    A relationship the user has already judged keeps its status. Detection can
-    add new candidates but never silently re-approves something that was
-    rejected, or downgrades something that was approved.
-    """
+def _detect_and_store(
+    project: Project,
+    db: Session,
+) -> List[Dict[str, Any]]:
+    """Detect relationships while preserving existing user decisions."""
     tables = model_tables(project, db)
+
     if len(tables) < 2:
         return []
 
     candidates = relationships.detect(project.id, tables)
+
     existing = {
-        (r.from_table_id, r.from_column, r.to_table_id, r.to_column): r
-        for r in db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
+        (
+            rel.from_table_id,
+            rel.from_column,
+            rel.to_table_id,
+            rel.to_column,
+        ): rel
+        for rel in db.query(TableRelationship).filter(
+            TableRelationship.project_id == project.id
+        ).all()
     }
 
     for candidate in candidates:
         key = (
-            candidate["from_table_id"], candidate["from_column"],
-            candidate["to_table_id"], candidate["to_column"],
+            candidate["from_table_id"],
+            candidate["from_column"],
+            candidate["to_table_id"],
+            candidate["to_column"],
         )
         record = existing.get(key)
+
         if record:
-            # Refresh the measurements, preserve the user's decision.
             record.confidence = candidate["confidence"]
             record.coverage = candidate["coverage"]
             record.evidence = candidate["evidence"]
@@ -875,36 +1348,77 @@ def _detect_and_store(project: Project, db: Session) -> List[Dict[str, Any]]:
                     notes=candidate["notes"],
                 )
             )
+
     db.commit()
 
-    names = {t["id"]: t["table_name"] for t in tables}
-    rows = db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
-    return [relationship_payload(r, names) for r in rows]
+    names = {
+        table["id"]: table["table_name"]
+        for table in tables
+    }
+
+    rows = (
+        db.query(TableRelationship)
+        .filter(TableRelationship.project_id == project.id)
+        .all()
+    )
+
+    return [
+        relationship_payload(rel, names)
+        for rel in rows
+    ]
 
 
 @app.post("/api/projects/{project_id}/relationships/detect")
 def detect_relationships(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
     tables = model_tables(project, db)
+
     if len(tables) < 2:
         return {
             "relationships": [],
-            "message": "Upload at least two tables before looking for relationships between them.",
+            "message": (
+                "Upload at least two tables before looking "
+                "for relationships between them."
+            ),
         }
+
     found = _detect_and_store(project, db)
-    return {"relationships": found, "message": f"{len(found)} relationship(s) in this model."}
+
+    return {
+        "relationships": found,
+        "message": f"{len(found)} relationship(s) in this model.",
+    }
 
 
 @app.get("/api/projects/{project_id}/relationships")
 def get_relationships(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> List[Dict[str, Any]]:
     project = owned_project(project_id, db, user)
-    names = {t.id: t.table_name for t in db.query(DataTable).filter(DataTable.project_id == project.id).all()}
-    rows = db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
-    return [relationship_payload(r, names) for r in rows]
+
+    names = {
+        table.id: table.table_name
+        for table in db.query(DataTable).filter(
+            DataTable.project_id == project.id
+        ).all()
+    }
+
+    rows = (
+        db.query(TableRelationship)
+        .filter(TableRelationship.project_id == project.id)
+        .all()
+    )
+
+    return [
+        relationship_payload(rel, names)
+        for rel in rows
+    ]
 
 
 class RelationshipStatus(BaseModel):
@@ -920,21 +1434,39 @@ def update_relationship(
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
+
     if payload.status not in {"approved", "rejected", "suggested"}:
-        raise HTTPException(status_code=400, detail="Status must be approved, rejected or suggested.")
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be approved, rejected or suggested.",
+        )
 
     record = (
         db.query(TableRelationship)
-        .filter(TableRelationship.id == relationship_id, TableRelationship.project_id == project.id)
+        .filter(
+            TableRelationship.id == relationship_id,
+            TableRelationship.project_id == project.id,
+        )
         .first()
     )
+
     if not record:
-        raise HTTPException(status_code=404, detail="Relationship not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Relationship not found.",
+        )
 
     record.status = payload.status
     db.commit()
     db.refresh(record)
-    names = {t.id: t.table_name for t in db.query(DataTable).filter(DataTable.project_id == project.id).all()}
+
+    names = {
+        table.id: table.table_name
+        for table in db.query(DataTable).filter(
+            DataTable.project_id == project.id
+        ).all()
+    }
+
     return relationship_payload(record, names)
 
 
@@ -952,27 +1484,42 @@ def create_relationship(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    """
-    Define a relationship by hand.
-
-    The link is still measured before it is saved, so the user finds out
-    immediately if the columns do not actually match up.
-    """
     project = owned_project(project_id, db, user)
-    tables = {t["id"]: t for t in model_tables(project, db)}
-    for table_id in (payload.from_table_id, payload.to_table_id):
+
+    tables = {
+        table["id"]: table
+        for table in model_tables(project, db)
+    }
+
+    for table_id in (
+        payload.from_table_id,
+        payload.to_table_id,
+    ):
         if table_id not in tables:
-            raise HTTPException(status_code=404, detail="One of those tables is not in this project.")
+            raise HTTPException(
+                status_code=404,
+                detail="One of those tables is not in this project.",
+            )
+
     if payload.from_table_id == payload.to_table_id:
-        raise HTTPException(status_code=400, detail="A relationship needs two different tables.")
+        raise HTTPException(
+            status_code=400,
+            detail="A relationship needs two different tables.",
+        )
 
     measured = relationships.measure_pair(
         project.id,
-        tables[payload.from_table_id], payload.from_column,
-        tables[payload.to_table_id], payload.to_column,
+        tables[payload.from_table_id],
+        payload.from_column,
+        tables[payload.to_table_id],
+        payload.to_column,
     )
+
     if measured is None:
-        raise HTTPException(status_code=400, detail="One of those columns does not exist.")
+        raise HTTPException(
+            status_code=400,
+            detail="One of those columns does not exist.",
+        )
 
     record = TableRelationship(
         project_id=project.id,
@@ -988,27 +1535,46 @@ def create_relationship(
         evidence=measured["evidence"],
         notes=measured["notes"],
     )
+
     db.add(record)
     db.commit()
     db.refresh(record)
-    names = {t["id"]: t["table_name"] for t in tables.values()}
+
+    names = {
+        table["id"]: table["table_name"]
+        for table in tables.values()
+    }
+
     return relationship_payload(record, names)
 
 
 @app.delete("/api/projects/{project_id}/relationships/{relationship_id}")
 def delete_relationship(
-    project_id: int, relationship_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    relationship_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, str]:
     project = owned_project(project_id, db, user)
+
     record = (
         db.query(TableRelationship)
-        .filter(TableRelationship.id == relationship_id, TableRelationship.project_id == project.id)
+        .filter(
+            TableRelationship.id == relationship_id,
+            TableRelationship.project_id == project.id,
+        )
         .first()
     )
+
     if not record:
-        raise HTTPException(status_code=404, detail="Relationship not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Relationship not found.",
+        )
+
     db.delete(record)
     db.commit()
+
     return {"message": "Relationship removed."}
 
 
@@ -1017,34 +1583,55 @@ def delete_relationship(
 
 @app.get("/api/projects/{project_id}/model")
 def get_model(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
     tables = model_tables(project, db)
-    names = {t["id"]: t["table_name"] for t in tables}
-    rels = db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
-    payloads = [relationship_payload(r, names) for r in rels]
+
+    names = {
+        table["id"]: table["table_name"]
+        for table in tables
+    }
+
+    rels = (
+        db.query(TableRelationship)
+        .filter(TableRelationship.project_id == project.id)
+        .all()
+    )
+
+    payloads = [
+        relationship_payload(rel, names)
+        for rel in rels
+    ]
 
     described = model_engine.describe_model(tables, payloads)
     described["relationships"] = payloads
+
     described["fields"] = [
         {
-            "table_id": t["id"],
-            "table_name": t["table_name"],
+            "table_id": table["id"],
+            "table_name": table["table_name"],
             "columns": [
                 {
-                    "name": c["name"],
-                    "logical_type": c["logical_type"],
-                    "semantic_role": c["semantic_role"],
-                    "default_aggregation": c.get("default_aggregation"),
-                    "additivity": c.get("additivity"),
-                    "distinct_count": c.get("distinct_count"),
+                    "name": column["name"],
+                    "logical_type": column["logical_type"],
+                    "semantic_role": column["semantic_role"],
+                    "default_aggregation": column.get(
+                        "default_aggregation"
+                    ),
+                    "additivity": column.get("additivity"),
+                    "distinct_count": column.get("distinct_count"),
                 }
-                for c in (t["profile"] or {}).get("columns", [])
+                for column in (
+                    table["profile"] or {}
+                ).get("columns", [])
             ],
         }
-        for t in tables
+        for table in tables
     ]
+
     return described
 
 
@@ -1064,23 +1651,33 @@ def run_query(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Dict[str, Any]:
-    """
-    Run an aggregate query, joining across approved relationships as needed.
-
-    Every chart and KPI in the app goes through here, which is why the numbers
-    on different screens now agree: they are all the same query.
-    """
     project = owned_project(project_id, db, user)
     tables = model_tables(project, db)
-    names = {t["id"]: t["table_name"] for t in tables}
+
+    names = {
+        table["id"]: table["table_name"]
+        for table in tables
+    }
+
     rels = [
-        relationship_payload(r, names)
-        for r in db.query(TableRelationship).filter(TableRelationship.project_id == project.id).all()
+        relationship_payload(rel, names)
+        for rel in db.query(TableRelationship).filter(
+            TableRelationship.project_id == project.id
+        ).all()
     ]
+
     try:
-        return model_engine.run_query(project.id, tables, rels, spec.model_dump())
+        return model_engine.run_query(
+            project.id,
+            tables,
+            rels,
+            spec.model_dump(),
+        )
     except model_engine.ModelError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
 
 # ─── Dashboards ──────────────────────────────────────────────────────────────
@@ -1093,13 +1690,28 @@ class DashboardPayload(BaseModel):
 
 @app.get("/api/projects/{project_id}/dashboard")
 def get_dashboard(
-    project_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)
+    project_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
 ) -> Dict[str, Any]:
     project = owned_project(project_id, db, user)
-    dashboard = db.query(Dashboard).filter(Dashboard.project_id == project.id).first()
+
+    dashboard = (
+        db.query(Dashboard)
+        .filter(Dashboard.project_id == project.id)
+        .first()
+    )
+
     if not dashboard:
-        return {"widgets": [], "layouts": {}}
-    return {"widgets": dashboard.widgets or [], "layouts": dashboard.layouts or {}}
+        return {
+            "widgets": [],
+            "layouts": {},
+        }
+
+    return {
+        "widgets": dashboard.widgets or [],
+        "layouts": dashboard.layouts or {},
+    }
 
 
 @app.post("/api/projects/{project_id}/dashboard")
@@ -1110,21 +1722,33 @@ def save_dashboard(
     user: User = Depends(current_user),
 ) -> Dict[str, str]:
     project = owned_project(project_id, db, user)
-    dashboard = db.query(Dashboard).filter(Dashboard.project_id == project.id).first()
+
+    dashboard = (
+        db.query(Dashboard)
+        .filter(Dashboard.project_id == project.id)
+        .first()
+    )
+
     if dashboard:
         dashboard.widgets = payload.widgets
         dashboard.layouts = payload.layouts
     else:
-        db.add(Dashboard(project_id=project.id, widgets=payload.widgets, layouts=payload.layouts))
+        db.add(
+            Dashboard(
+                project_id=project.id,
+                widgets=payload.widgets,
+                layouts=payload.layouts,
+            )
+        )
+
     db.commit()
+
     return {"message": "Dashboard saved."}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # 8005 is deliberately not the default: it is a commonly occupied port and
-    # was already taken on the development machine by an unrelated service.
     uvicorn.run(
         "main:app",
         host=os.getenv("API_HOST", "127.0.0.1"),

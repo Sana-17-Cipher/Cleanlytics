@@ -1,35 +1,61 @@
 'use client';
 
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  AlertCircle, CheckCircle2, Database, FileSpreadsheet, Link2, Trash2, Upload, X,
+  AlertCircle,
+  CheckCircle2,
+  Database,
+  FileSpreadsheet,
+  Link2,
+  Loader2,
+  Trash2,
+  Upload,
+  X,
 } from 'lucide-react';
 
 import { ApiError, api } from '../lib/api';
 import { bytes, count, pluralise } from '../lib/format';
 import type { TableSummary, UploadResult } from '../lib/types';
 
-const ACCEPTED = ['.csv', '.tsv', '.txt', '.xlsx', '.xls', '.xlsm', '.parquet'];
+const ACCEPTED = [
+  '.csv',
+  '.tsv',
+  '.txt',
+  '.xlsx',
+  '.xls',
+  '.xlsm',
+  '.parquet',
+];
 
 interface UploadModuleProps {
   projectId: number | null;
   tables: TableSummary[];
   maxUploadMb: number;
-  onUploaded: (result: UploadResult) => void;
+  onUploaded: (result: UploadResult) => void | Promise<void>;
   onDeleteTable: (tableId: number) => void;
   onSelectTable: (tableId: number) => void;
   activeTableId: number | null;
 }
 
-/**
- * File intake.
- *
- * Selecting several files sends them as one request, so they all land in the
- * same project and relationship detection runs across the whole set. The
- * previous version looped and created a separate project per file, which made
- * the multi-table model impossible to reach by dropping files together.
- */
-export default function UploadModule({
+function fileKey(file: File) {
+  return JSON.stringify([
+    file.name,
+    file.size,
+    file.lastModified,
+  ]);
+}
+
+export default function UploadModule(props: UploadModuleProps) {
+  // Reset selections when the user switches projects.
+  return (
+    <ProjectUpload
+      key={props.projectId ?? 'no-project'}
+      {...props}
+    />
+  );
+}
+
+function ProjectUpload({
   projectId,
   tables,
   maxUploadMb,
@@ -44,267 +70,477 @@ export default function UploadModule({
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<UploadResult | null>(null);
+
   const inputRef = useRef<HTMLInputElement>(null);
+  const mounted = useRef(true);
+  const inFlight = useRef(false);
+  const dragDepth = useRef(0);
 
-  const addFiles = useCallback(
-    (incoming: FileList | null) => {
-      if (!incoming?.length) return;
-      setError(null);
+  useEffect(() => {
+    mounted.current = true;
 
-      const accepted: File[] = [];
-      const rejected: string[] = [];
-      Array.from(incoming).forEach((file) => {
-        const extension = `.${file.name.split('.').pop()?.toLowerCase() ?? ''}`;
-        if (!ACCEPTED.includes(extension)) {
-          rejected.push(`${file.name} (${extension} is not supported)`);
-        } else if (file.size > maxUploadMb * 1024 * 1024) {
-          rejected.push(`${file.name} (${bytes(file.size)} exceeds the ${maxUploadMb} MB limit)`);
-        } else {
-          accepted.push(file);
-        }
-      });
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
-      if (rejected.length) setError(`Skipped: ${rejected.join(', ')}`);
-      setQueued((previous) => {
-        const seen = new Set(previous.map((f) => `${f.name}:${f.size}`));
-        return [...previous, ...accepted.filter((f) => !seen.has(`${f.name}:${f.size}`))];
-      });
-    },
-    [maxUploadMb],
+  const disabled = busy || projectId === null;
+  const totalBytes = queued.reduce(
+    (sum, file) => sum + file.size,
+    0,
   );
+  const uploadPercent = Math.round(progress * 100);
 
-  const handleDrop = (event: React.DragEvent) => {
-    event.preventDefault();
-    setDragging(false);
-    addFiles(event.dataTransfer.files);
-  };
+  const approved =
+    outcome?.relationships.filter(
+      (relationship) => relationship.status === 'approved',
+    ) ?? [];
 
-  const startUpload = async () => {
-    if (!projectId || !queued.length) return;
+  const pending =
+    outcome?.relationships.filter(
+      (relationship) => relationship.status === 'suggested',
+    ).length ?? 0;
+
+  function addFiles(incoming: FileList | null) {
+    if (
+      !incoming?.length ||
+      inFlight.current ||
+      projectId === null
+    ) {
+      return;
+    }
+
+    const accepted: File[] = [];
+    const rejected: string[] = [];
+
+    for (const file of Array.from(incoming)) {
+      const extension =
+        `.${file.name.split('.').pop()?.toLowerCase() ?? ''}`;
+
+      if (!ACCEPTED.includes(extension)) {
+        rejected.push(`${file.name}: unsupported format.`);
+      } else if (file.size === 0) {
+        rejected.push(`${file.name}: the file is empty.`);
+      } else if (file.size > maxUploadMb * 1024 * 1024) {
+        rejected.push(
+          `${file.name}: exceeds the ${maxUploadMb} MB limit.`,
+        );
+      } else {
+        accepted.push(file);
+      }
+    }
+
+    setError(rejected.length ? rejected.join(' ') : null);
+
+    setQueued((previous) => {
+      const seen = new Set(previous.map(fileKey));
+      const next = [...previous];
+
+      for (const file of accepted) {
+        const key = fileKey(file);
+
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        next.push(file);
+      }
+
+      return next;
+    });
+  }
+
+  async function startUpload() {
+    if (
+      projectId === null ||
+      queued.length === 0 ||
+      inFlight.current
+    ) {
+      return;
+    }
+
+    inFlight.current = true;
     setBusy(true);
     setProgress(0);
     setError(null);
     setOutcome(null);
-    try {
-      const result = await api.uploadTables(projectId, queued, setProgress);
-      setOutcome(result);
-      setQueued([]);
-      onUploaded(result);
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'The upload failed.');
-    } finally {
-      setBusy(false);
-      setProgress(0);
-    }
-  };
 
-  const totalQueuedBytes = queued.reduce((sum, file) => sum + file.size, 0);
+    try {
+      const result = await api.uploadTables(
+        projectId,
+        [...queued],
+        (fraction) => {
+          if (mounted.current && Number.isFinite(fraction)) {
+            setProgress(Math.max(0, Math.min(1, fraction)));
+          }
+        },
+      );
+
+      if (!mounted.current) return;
+
+      setOutcome(result);
+
+      // A workbook can partially succeed. Automatically retrying
+      // the entire file could duplicate sheets already imported.
+      setQueued([]);
+
+      try {
+        await onUploaded(result);
+      } catch {
+        if (mounted.current) {
+          setError(
+            'The server responded, but the project view could not refresh. ' +
+            'Reload the project before uploading again.',
+          );
+        }
+      }
+    } catch (cause) {
+      if (mounted.current) {
+        const message =
+          cause instanceof ApiError
+            ? cause.message
+            : 'The upload could not be completed.';
+
+        setError(
+          `${message} Check the project before retrying; ` +
+          'the server may have received some files.',
+        );
+      }
+    } finally {
+      inFlight.current = false;
+
+      if (mounted.current) {
+        setBusy(false);
+        setProgress(0);
+      }
+    }
+  }
 
   return (
-    <div className="space-y-5 animate-fade-in">
+    <div
+      className="space-y-5 animate-fade-in"
+      aria-busy={busy}
+    >
       <div>
-        <h2 className="text-xl font-bold tracking-tight text-white">Data sources</h2>
+        <h2 className="text-xl font-bold text-white">
+          Data sources
+        </h2>
         <p className="text-xs text-gray-400 mt-1">
-          Add several files at once. Each file becomes a table, each Excel sheet becomes its own
-          table, and links between them are found automatically.
+          Upload related files together. Each Excel sheet becomes
+          a table. The system profiles columns and searches for
+          relationships.
         </p>
       </div>
 
-      {/* Drop zone */}
-      <div
-        onDragEnter={(e) => { e.preventDefault(); setDragging(true); }}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-        onDragLeave={(e) => { e.preventDefault(); setDragging(false); }}
-        onDrop={handleDrop}
-        onClick={() => !busy && inputRef.current?.click()}
-        className={`glass-panel border-dashed rounded-xl p-10 flex flex-col items-center justify-center text-center transition-colors ${
-          busy ? 'cursor-wait opacity-70' : 'cursor-pointer'
-        } ${dragging ? 'border-emerald-500 bg-emerald-950/20' : 'border-gray-800 hover:border-cyan-500/50'}`}
+      {projectId === null && (
+        <p
+          role="status"
+          className="rounded-lg border border-amber-900/50 bg-amber-950/20 p-4 text-xs text-amber-200"
+        >
+          Create or select a project before uploading files.
+        </p>
+      )}
+
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        accept={ACCEPTED.join(',')}
+        className="hidden"
+        disabled={disabled}
+        onChange={(event) => {
+          addFiles(event.target.files);
+          event.target.value = '';
+        }}
+      />
+
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => inputRef.current?.click()}
+        onDragEnter={(event) => {
+          event.preventDefault();
+
+          if (disabled) return;
+
+          dragDepth.current += 1;
+          setDragging(true);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = disabled
+            ? 'none'
+            : 'copy';
+        }}
+        onDragLeave={(event) => {
+          event.preventDefault();
+
+          dragDepth.current = Math.max(
+            0,
+            dragDepth.current - 1,
+          );
+
+          if (dragDepth.current === 0) {
+            setDragging(false);
+          }
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          dragDepth.current = 0;
+          setDragging(false);
+
+          if (!disabled) {
+            addFiles(event.dataTransfer.files);
+          }
+        }}
+        className={`glass-panel w-full border-dashed rounded-xl p-10 flex flex-col items-center gap-3 text-center transition focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:opacity-50 ${
+          dragging
+            ? 'border-emerald-500 bg-emerald-950/20'
+            : 'border-gray-800 hover:border-cyan-500/50'
+        }`}
       >
-        <input
-          ref={inputRef}
-          type="file"
-          multiple
-          accept={ACCEPTED.join(',')}
-          className="hidden"
-          disabled={busy}
-          onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }}
-        />
-        <div className="h-14 w-14 rounded-full bg-zinc-900/80 border border-gray-800 flex items-center justify-center mb-3">
-          <Upload className="h-6 w-6 text-gray-400" />
-        </div>
-        <p className="text-sm font-semibold text-gray-200">
-          {tables.length ? 'Add more files to this project' : 'Drop your files here, or click to browse'}
-        </p>
-        <p className="text-xs text-gray-500 mt-1.5">
-          CSV, Excel and Parquet · up to {maxUploadMb} MB each · select as many as you like
-        </p>
-      </div>
+        <Upload className="h-8 w-8 text-cyan-400" />
 
-      {/* Queue */}
+        <span className="text-sm font-semibold text-gray-200">
+          Drop files here or click to browse
+        </span>
+
+        <span className="text-xs text-gray-500">
+          CSV, TSV, Excel and Parquet · up to {maxUploadMb} MB
+          per file
+        </span>
+      </button>
+
       {queued.length > 0 && (
         <div className="glass-panel rounded-xl border border-gray-800 p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <p className="text-xs font-semibold text-gray-200">
-              {pluralise(queued.length, 'file')} ready · {bytes(totalQueuedBytes)}
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-gray-200">
+              {pluralise(queued.length, 'file')} selected
+              {' · '}
+              {bytes(totalBytes)}
             </p>
+
             <button
-              onClick={() => setQueued([])}
+              type="button"
               disabled={busy}
-              className="text-[11px] text-gray-500 hover:text-gray-300 disabled:opacity-40"
+              onClick={() => setQueued([])}
+              className="text-xs text-gray-400 disabled:opacity-40"
             >
-              Clear
+              Clear selection
             </button>
           </div>
 
-          <div className="space-y-1.5 max-h-44 overflow-y-auto">
-            {queued.map((file, index) => (
+          <div className="space-y-2 max-h-48 overflow-y-auto">
+            {queued.map((file) => (
               <div
-                key={`${file.name}-${file.size}-${index}`}
-                className="flex items-center justify-between text-xs bg-zinc-900/40 border border-gray-800/60 rounded-lg px-3 py-2"
+                key={fileKey(file)}
+                className="flex items-center gap-3 rounded-lg border border-gray-800 px-3 py-2 text-xs"
               >
-                <span className="flex items-center gap-2 min-w-0">
-                  <FileSpreadsheet className="h-3.5 w-3.5 text-cyan-400 shrink-0" />
-                  <span className="truncate text-gray-200">{file.name}</span>
+                <FileSpreadsheet className="h-4 w-4 text-cyan-400 shrink-0" />
+
+                <span
+                  title={file.name}
+                  className="flex-1 min-w-0 truncate text-gray-200"
+                >
+                  {file.name}
                 </span>
-                <span className="flex items-center gap-3 shrink-0 ml-3">
-                  <span className="text-gray-500 font-mono text-[10px]">{bytes(file.size)}</span>
-                  <button
-                    onClick={() => setQueued((q) => q.filter((_, i) => i !== index))}
-                    disabled={busy}
-                    className="text-gray-600 hover:text-red-400 disabled:opacity-40"
-                    aria-label={`Remove ${file.name}`}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
+
+                <span className="text-gray-500 shrink-0">
+                  {bytes(file.size)}
                 </span>
+
+                <button
+                  type="button"
+                  disabled={busy}
+                  aria-label={`Remove ${file.name}`}
+                  className="text-gray-500 hover:text-red-400 disabled:opacity-40"
+                  onClick={() => {
+                    setQueued((files) =>
+                      files.filter(
+                        (entry) => fileKey(entry) !== fileKey(file),
+                      ),
+                    );
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
             ))}
           </div>
 
-          {busy && (
-            <div className="space-y-1.5">
-              <div className="h-1 w-full bg-zinc-800 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-cyan-500 to-emerald-500 transition-[width] duration-200"
-                  style={{ width: `${Math.round(progress * 100)}%` }}
-                />
-              </div>
-              <p className="text-[10px] text-gray-500">
-                {progress >= 1
-                  ? 'Reading the data and analysing it. Large files take a few seconds.'
-                  : `Uploading ${Math.round(progress * 100)}%`}
-              </p>
-            </div>
-          )}
-
           <button
+            type="button"
             onClick={startUpload}
-            disabled={busy || !projectId}
-            className="w-full py-2.5 rounded-lg bg-gradient-to-r from-cyan-500 to-emerald-500 text-white text-xs font-semibold disabled:opacity-50 transition"
+            disabled={disabled}
+            className="w-full flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-cyan-600 to-emerald-600 py-3 text-xs font-semibold text-white disabled:opacity-50"
           >
-            {busy ? 'Working…' : `Load ${pluralise(queued.length, 'file')}`}
+            {busy && (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            )}
+
+            {busy
+              ? 'Working…'
+              : `Upload and analyse ${pluralise(queued.length, 'file')}`}
           </button>
         </div>
       )}
 
+      {busy && (
+        <div
+          className="space-y-2"
+          role="status"
+          aria-live="polite"
+        >
+          <progress
+            aria-label="File transfer progress"
+            value={progress}
+            max={1}
+            className="w-full h-2 accent-emerald-400"
+          />
+
+          <p className="text-xs text-gray-400">
+            {progress >= 1
+              ? 'Files transferred. Waiting for the server to finish processing…'
+              : `Uploading files: ${uploadPercent}%`}
+          </p>
+
+          <p className="text-xs text-gray-500">
+            Keep this screen open until processing finishes.
+          </p>
+        </div>
+      )}
+
       {error && (
-        <div className="flex items-start gap-3 p-4 rounded-lg bg-red-950/20 border border-red-900/50 text-red-300 text-xs">
-          <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-red-900/50 bg-red-950/20 p-4 text-xs text-red-300"
+        >
+          <AlertCircle className="h-4 w-4 shrink-0" />
           <p>{error}</p>
         </div>
       )}
 
-      {/* What happened, including per-file failures */}
       {outcome && (
-        <div className="glass-panel rounded-xl border border-gray-800 p-4 space-y-3">
-          <p className="text-xs font-semibold text-gray-100">{outcome.message}</p>
+        <div
+          className="glass-panel rounded-xl border border-gray-800 p-4 space-y-3"
+          aria-live="polite"
+        >
+          <p className="text-sm font-semibold text-white">
+            {outcome.message}
+          </p>
+
+          <p className="text-xs text-gray-400">
+            {outcome.tables.length} tables loaded
+            {' · '}
+            {outcome.failed.length} file errors
+          </p>
+
+          {outcome.failed.map((failure, index) => (
+            <p
+              key={`${failure.file}-${index}`}
+              className="rounded-lg bg-red-950/20 p-3 text-xs text-red-300"
+            >
+              <strong>{failure.file}</strong>: {failure.error}
+            </p>
+          ))}
 
           {outcome.failed.length > 0 && (
-            <div className="space-y-1.5">
-              {outcome.failed.map((failure) => (
-                <div
-                  key={failure.file}
-                  className="flex items-start gap-2 text-[11px] text-red-300 bg-red-950/20 border border-red-900/40 rounded-lg px-3 py-2"
-                >
-                  <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
-                  <span>
-                    <span className="font-semibold">{failure.file}</span> — {failure.error}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <p className="text-xs text-amber-300">
+              Check which tables loaded before selecting failed
+              files again. A workbook may have loaded some sheets
+              successfully.
+            </p>
           )}
 
-          {outcome.relationships.filter((r) => r.status === 'approved').length > 0 && (
-            <div className="space-y-1">
-              {outcome.relationships
-                .filter((r) => r.status === 'approved')
-                .map((link) => (
-                  <p key={link.id} className="text-[11px] text-emerald-300 flex items-center gap-1.5">
-                    <Link2 className="h-3 w-3 shrink-0" />
-                    <span className="font-mono">
-                      {link.from_table_name}.{link.from_column} → {link.to_table_name}.{link.to_column}
-                    </span>
-                    <span className="text-gray-500">({link.cardinality_label})</span>
-                  </p>
-                ))}
-            </div>
+          {approved.map((link) => (
+            <p
+              key={link.id}
+              className="flex items-start gap-2 text-xs text-emerald-300"
+            >
+              <Link2 className="h-4 w-4 shrink-0" />
+
+              <span className="break-words">
+                {link.from_table_name}.{link.from_column}
+                {' → '}
+                {link.to_table_name}.{link.to_column}
+                {' '}
+                ({link.cardinality_label})
+              </span>
+            </p>
+          ))}
+
+          {pending > 0 && (
+            <p className="text-xs text-amber-300">
+              {pluralise(pending, 'relationship')} waiting for
+              review in Model.
+            </p>
           )}
         </div>
       )}
 
-      {/* Tables already in the project */}
       {tables.length > 0 && (
-        <div className="space-y-3">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+        <section className="space-y-3">
+          <h3 className="flex items-center gap-2 text-sm font-bold text-white">
             <Database className="h-4 w-4 text-emerald-400" />
             Tables in this project ({tables.length})
           </h3>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {tables.map((table) => {
-              const active = table.id === activeTableId;
-              const score = table.summary?.quality_score;
-              return (
-                <div
-                  key={table.id}
-                  onClick={() => onSelectTable(table.id)}
-                  className={`glass-panel p-4 rounded-xl border cursor-pointer transition space-y-2 ${
-                    active ? 'border-cyan-500/50 ring-1 ring-cyan-500/20' : 'border-gray-800 hover:border-gray-700'
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-extrabold text-white truncate">{table.table_name}</span>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); onDeleteTable(table.id); }}
-                      className="text-gray-600 hover:text-red-400 shrink-0"
-                      aria-label={`Remove ${table.table_name}`}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
+            {tables.map((table) => (
+              <div
+                key={table.id}
+                className={`glass-panel rounded-xl border p-4 space-y-3 ${
+                  table.id === activeTableId
+                    ? 'border-cyan-500/50 ring-1 ring-cyan-500/20'
+                    : 'border-gray-800'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onSelectTable(table.id)}
+                    title={table.table_name}
+                    className="min-w-0 truncate text-left text-sm font-semibold text-white hover:text-cyan-300 disabled:opacity-50"
+                  >
+                    {table.table_name}
+                  </button>
 
-                  <p className="text-[10px] text-gray-500 truncate">
-                    {table.source_file}
-                    {table.source_sheet ? ` · sheet “${table.source_sheet}”` : ''}
-                  </p>
-
-                  <div className="flex items-center gap-3 text-[10px] text-gray-500 pt-1 border-t border-gray-800/40">
-                    <span>{count(table.row_count)} rows</span>
-                    <span>{table.column_count} cols</span>
-                    {score != null && (
-                      <span className="flex items-center gap-1 ml-auto">
-                        <CheckCircle2 className="h-3 w-3 text-emerald-500" />
-                        {score}%
-                      </span>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => onDeleteTable(table.id)}
+                    aria-label={`Remove ${table.table_name}`}
+                    className="text-gray-500 hover:text-red-400 disabled:opacity-40"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
                 </div>
-              );
-            })}
+
+                <p
+                  title={table.source_file}
+                  className="text-xs text-gray-500 truncate"
+                >
+                  {table.source_file}
+                  {table.source_sheet
+                    ? ` · ${table.source_sheet}`
+                    : ''}
+                </p>
+
+                <div className="flex flex-wrap items-center gap-3 border-t border-gray-800 pt-2 text-xs text-gray-400">
+                  <span>{count(table.row_count)} rows</span>
+                  <span>{table.column_count} columns</span>
+
+                  {table.summary?.quality_score != null && (
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="h-3 w-3" />
+                      {table.summary.quality_score}% quality
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
-        </div>
+        </section>
       )}
     </div>
   );

@@ -1,9 +1,8 @@
 /**
  * Shape of everything the analysis API returns.
  *
- * These mirror the Python payloads exactly. Keeping one source of truth on the
- * client means a field that gets renamed on the server shows up as a type error
- * here rather than as `undefined` in the middle of a chart.
+ * New metadata is optional so older saved profiles remain compatible.
+ * TypeScript checks callers; it does not validate JSON at runtime.
  */
 
 export type LogicalType =
@@ -40,7 +39,11 @@ export type Additivity = 'additive' | 'semi_additive' | 'non_additive';
 
 export type Severity = 'high' | 'medium' | 'low';
 
-export type Cardinality = 'one_to_one' | 'one_to_many' | 'many_to_one' | 'many_to_many';
+export type Cardinality =
+  | 'one_to_one'
+  | 'one_to_many'
+  | 'many_to_one'
+  | 'many_to_many';
 
 export type RelationshipStatus = 'suggested' | 'approved' | 'rejected';
 
@@ -71,6 +74,8 @@ export interface NumericStatistics {
   iqr?: number;
   outlier_low?: number;
   outlier_high?: number;
+  non_finite_count?: number;
+  quantiles_approximate?: boolean;
 }
 
 export interface TextStatistics {
@@ -80,6 +85,7 @@ export interface TextStatistics {
   whitespace_count: number;
   blank_count: number;
   case_variant_count: number;
+  case_variant_measured?: boolean;
 }
 
 export interface TemporalStatistics {
@@ -87,7 +93,13 @@ export interface TemporalStatistics {
   max: string | null;
 }
 
-export type ColumnStatistics = Partial<NumericStatistics & TextStatistics & TemporalStatistics>;
+/** Numeric and temporal bounds have different JSON types. */
+export type ColumnStatistics = Partial<
+  Omit<NumericStatistics, 'min' | 'max'> & TextStatistics
+> & {
+  min?: number | string | null;
+  max?: number | string | null;
+};
 
 export interface ColumnProfile {
   name: string;
@@ -97,8 +109,13 @@ export interface ColumnProfile {
   subtype: string | null;
   semantic_role: SemanticRole;
   confidence: number;
+  role_scores?: Partial<Record<SemanticRole, number>>;
+  needs_review?: boolean;
+  source?: string;
+
   /** Plain-language explanation of why this role was chosen. */
   reasons: string[];
+
   additivity: Additivity;
   default_aggregation: Aggregation;
   row_count: number;
@@ -109,9 +126,22 @@ export interface ColumnProfile {
   distinct_is_approximate: boolean;
   unique_ratio: number;
   is_unique: boolean;
+
+  /** False when distinct counts were estimated rather than verified. */
+  uniqueness_verified?: boolean;
+
   is_constant: boolean;
   is_empty: boolean;
+
+  /** Blank strings are separate from SQL NULL values. */
+  blank_count?: number;
+  missing_count?: number;
+
   invalid_count: number;
+  invalid_count_is_estimate?: boolean;
+  invalid_count_measured?: boolean;
+  pattern_sampled?: boolean;
+  pattern_values_checked?: number;
   top_values: TopValue[];
   statistics: ColumnStatistics;
   patterns?: Record<string, number>;
@@ -124,15 +154,34 @@ export interface QualityComponents {
   validity: number;
 }
 
+export type QualityComponentName = keyof QualityComponents;
+
+export type QualityMeasurementFlags = Record<QualityComponentName, boolean>;
+
 export interface DatasetSummary {
   rows: number;
   columns: number;
   total_cells: number;
+
+  /** SQL NULL cells only; blanks are reported separately. */
   total_missing: number;
+  total_blank?: number;
+  total_missing_including_blanks?: number;
+
   duplicate_rows: number | null;
   duplicate_rows_measured: boolean;
+
+  /** Indicative score from measured checks, not business accuracy. */
   quality_score: number;
+  quality_score_available?: boolean;
   quality_components: QualityComponents;
+
+  /** An unmeasured component has a placeholder zero, not a failing score. */
+  quality_components_measured?: QualityMeasurementFlags;
+
+  quality_note?: string;
+  patterns_sampled?: boolean;
+  distinct_counts_approximate?: boolean;
   quality_weights: QualityComponents;
   role_counts: Partial<Record<SemanticRole, number>>;
   measure_count: number;
@@ -152,8 +201,10 @@ export interface QualityAction {
   operation: string;
   params: Record<string, unknown>;
   label: string;
-  /** Exactly what happens to the data, including how much is removed. */
+
+  /** What happens to the data, including how much is removed. */
   consequence: string;
+
   destructive: boolean;
   recommended: boolean;
 }
@@ -252,6 +303,7 @@ export interface ProjectDetail {
 }
 
 export interface UploadResult {
+  warnings?: string[];
   tables: TableSummary[];
   failed: { file: string; error: string }[];
   relationships: Relationship[];
@@ -352,8 +404,10 @@ export interface QueryResult {
   row_count: number;
   truncated: boolean;
   fields: QueryField[];
-  /** The SQL that produced these numbers, so any figure can be traced. */
+
+  /** The SQL that produced these numbers, so figures can be traced. */
   sql: string;
+
   warnings: string[];
   base_table_name: string;
   joined_tables: string[];
@@ -380,7 +434,17 @@ export interface ModelFieldGroup {
   }[];
 }
 
+/** Runnable backend suggestions; user-saved layouts are separate. */
+export interface DashboardPlan {
+  version: 1;
+  widgets: AnalysisSuggestion[];
+  notes: string[];
+}
+
 export interface SemanticModel {
+  /** Optional for models generated before dashboard planning was added. */
+  dashboard_plan?: DashboardPlan | null;
+
   tables: ModelTable[];
   relationships: Relationship[];
   relationship_count: number;

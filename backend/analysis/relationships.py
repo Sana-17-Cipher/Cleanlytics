@@ -1,311 +1,35 @@
 """
-CLEANYTICS - relationship discovery between tables.
+CLEANYTICS — relationship discovery.
 
-The question "does Sales.Customer_ID point at Customers.Customer_ID?" is
-answered by looking at the values, not by comparing names and hoping. For every
-plausible pair of key columns this measures containment in both directions:
+Candidate selection uses column profiles. Cardinality and overlap are
+verified against current data using exact, read-only queries.
 
-    how many of Sales' customer ids actually exist in Customers?   -> 100%
-    how many of Customers' ids appear in Sales?                    ->  80%
-
-The side whose values are fully contained in the other is the foreign key. That
-single measurement fixes the bug in the previous build, where direction was
-inferred from uniqueness alone and every relationship came out labelled
-backwards (N:1 printed as 1:N).
-
-Names still matter, but only as a tiebreaker and a confidence booster. Data
-wins.
+Scores are heuristics, not probabilities.
+Composite keys are not inferred by this module.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import duckdb
-
-from store import connect, q, table_exists
+from store import connect, describe, q, table_exists
 from analysis import semantics
 
-# Below this combined score a pair is not worth showing at all.
+
 SUGGEST_THRESHOLD = 0.55
-
-# A pair this strong is linked automatically. Deliberately strict: near-total
-# containment, a genuinely unique key on the parent side, and a name that lines
-# up. Anything less is offered as a suggestion for the user to confirm.
-AUTO_APPROVE_CONTAINMENT = 0.99
+AUTO_APPROVE_CONTAINMENT = 1.0
 AUTO_APPROVE_SCORE = 0.90
+MIN_AUTO_SHARED_VALUES = 3
 
-# Cap on distinct values pulled into a containment check, so one pathological
-# column cannot stall the whole scan.
-MAX_DISTINCT_FOR_OVERLAP = 2_000_000
+EXCLUDED_ROLES = {"measure", "text", "boolean"}
 
-# Roles that can never take part in a join.
-EXCLUDED_ROLES = {"measure", "text"}
+KEY_TOKENS = {
+    "id", "key", "code", "no", "num", "number",
+    "pk", "fk", "ref", "uuid", "guid",
+}
 
-
-# ─── Name affinity ───────────────────────────────────────────────────────────
-
-
-def _tokenise(name: str) -> List[str]:
-    """Split a column or table name into comparable lowercase tokens."""
-    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name or ""))
-    parts = re.split(r"[^A-Za-z0-9]+", spaced)
-    tokens = [p.lower() for p in parts if p]
-    # Singularise the common plural table name so "Customers" matches
-    # "customer_id".
-    normalised = []
-    for token in tokens:
-        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-            normalised.append(token[:-1])
-        else:
-            normalised.append(token)
-    return normalised
-
-
-KEY_TOKENS = {"id", "key", "code", "no", "num", "number", "pk", "fk", "ref"}
-
-
-def name_affinity(fk_table: str, fk_column: str, pk_table: str, pk_column: str) -> float:
-    """
-    Score how strongly two column names suggest a relationship, 0 to 1.
-
-    Handles the case that trips up naive matching: a parent table whose key is
-    just called "id". `Customers.id` and `Orders.customer_id` share no column
-    tokens at all, but once the parent's table name is folded in they line up
-    exactly.
-    """
-    fk_tokens = _tokenise(fk_column)
-    pk_tokens = _tokenise(pk_column)
-
-    if not fk_tokens or not pk_tokens:
-        return 0.0
-
-    if fk_tokens == pk_tokens:
-        return 1.0
-
-    fk_set, pk_set = set(fk_tokens), set(pk_tokens)
-
-    # Compare the meaningful parts, ignoring the shared "id"/"key" suffix.
-    fk_core = fk_set - KEY_TOKENS
-    pk_core = pk_set - KEY_TOKENS
-
-    if fk_core and pk_core and fk_core == pk_core:
-        return 0.95
-
-    # Parent key is bare ("id"): borrow the parent's table name.
-    if not pk_core and fk_core:
-        pk_table_tokens = set(_tokenise(pk_table))
-        if fk_core & pk_table_tokens:
-            return 0.9 if fk_core <= pk_table_tokens else 0.75
-
-    # Child key is bare: same trick in reverse.
-    if not fk_core and pk_core:
-        fk_table_tokens = set(_tokenise(fk_table))
-        if pk_core & fk_table_tokens:
-            return 0.7
-
-    if fk_core and pk_core:
-        overlap = fk_core & pk_core
-        if overlap:
-            return round(0.5 + 0.3 * (len(overlap) / max(len(fk_core | pk_core), 1)), 3)
-
-    # Both are bare keys ("id" to "id"): the names say nothing useful, so the
-    # decision rests entirely on the values.
-    if not fk_core and not pk_core:
-        return 0.3
-
-    return 0.0
-
-
-# ─── Type compatibility ──────────────────────────────────────────────────────
-
-
-def type_compatibility(a_type: str, b_type: str) -> float:
-    """
-    How joinable two physical types are.
-
-    Integer keys exported to CSV routinely come back as text in one file and as
-    numbers in another, so that pairing is allowed but scored slightly lower and
-    reported, since it needs a cast at query time.
-    """
-    a_num, b_num = semantics.is_numeric_type(a_type), semantics.is_numeric_type(b_type)
-    a_time, b_time = semantics.is_temporal_type(a_type), semantics.is_temporal_type(b_type)
-    a_base, b_base = semantics.base_duck_type(a_type), semantics.base_duck_type(b_type)
-
-    if a_base == b_base:
-        return 1.0
-    if a_num and b_num:
-        return 0.95
-    if a_time and b_time:
-        return 0.9
-    if (a_num and b_base == "VARCHAR") or (b_num and a_base == "VARCHAR"):
-        return 0.7
-    if a_base == "VARCHAR" and b_base == "VARCHAR":
-        return 1.0
-    return 0.0
-
-
-# ─── Candidate selection ─────────────────────────────────────────────────────
-
-
-def _key_candidates(table: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Narrow a table's columns down to those that could take part in a join.
-
-    Without this filter the scan is O(columns squared) across every pair of
-    tables and produces nonsense matches between unrelated numeric columns.
-    """
-    profile = table.get("profile") or {}
-    candidates = []
-    for column in profile.get("columns", []):
-        role = column.get("semantic_role")
-        if role in EXCLUDED_ROLES:
-            continue
-        if column.get("is_constant") or column.get("is_empty"):
-            continue
-        if column.get("logical_type") == "boolean" or role == "boolean":
-            continue
-        if column.get("subtype") in {"email", "phone", "url"}:
-            # These do identify a person, but joining two files on an email
-            # column is a data-matching exercise, not a data model.
-            continue
-        if int(column.get("distinct_count") or 0) < 2:
-            continue
-        candidates.append(column)
-    return candidates
-
-
-def domain_distinctiveness(column: Dict[str, Any]) -> float:
-    """
-    How much a value match actually tells us, from 0 (nothing) to 1 (a lot).
-
-    This is the guard against the most common false positive in key discovery.
-    Two unrelated tables that both number their rows 1, 2, 3... will show 100%
-    value containment, because every small integer sequence is contained in
-    every longer one. Matching on "C4471-XZ" is strong evidence; matching on
-    "7" is almost none.
-    """
-    logical = column.get("logical_type")
-    stats = column.get("statistics") or {}
-    ndv = int(column.get("distinct_count") or 0)
-
-    if logical in {"date", "datetime", "time"}:
-        # Calendars overlap by construction; two tables covering 2024 share
-        # every date without being related at all.
-        return 0.2
-
-    if logical == "text":
-        average = float(stats.get("avg_length") or 0)
-        if average >= 6:
-            return 0.95
-        if average >= 4:
-            return 0.85
-        return 0.5
-
-    if logical in {"integer", "decimal", "currency", "percentage"}:
-        low, high = stats.get("min"), stats.get("max")
-        try:
-            if low is not None and high is not None and ndv > 0:
-                span = float(high) - float(low) + 1
-                # A dense run of small integers is a row counter, not a key
-                # with meaning of its own.
-                dense = span <= ndv * 1.2
-                if dense and float(low) <= 10 and float(high) < 100_000:
-                    return 0.1
-                if dense:
-                    return 0.35
-                if span > ndv * 50:
-                    # Sparse, widely spread numbers are hard to collide with.
-                    return 0.8
-        except (TypeError, ValueError):
-            pass
-        return 0.45
-
-    return 0.4
-
-
-def _worth_testing(
-    fk_table: Dict[str, Any],
-    fk_column: Dict[str, Any],
-    pk_table: Dict[str, Any],
-    pk_column: Dict[str, Any],
-) -> Optional[Tuple[float, float]]:
-    """Cheap pre-filter, so containment SQL only runs on plausible pairs."""
-    compatibility = type_compatibility(fk_column.get("physical_type", ""), pk_column.get("physical_type", ""))
-    if compatibility <= 0.0:
-        return None
-
-    affinity = name_affinity(
-        fk_table["table_name"], fk_column["name"], pk_table["table_name"], pk_column["name"]
-    )
-
-    # Either the names line up, or the values themselves are distinctive enough
-    # that a match cannot reasonably be coincidence. A pair with neither is not
-    # worth the query.
-    if affinity >= 0.5:
-        return compatibility, affinity
-
-    distinctiveness = max(domain_distinctiveness(fk_column), domain_distinctiveness(pk_column))
-    if distinctiveness >= 0.6:
-        return compatibility, affinity
-
-    return None
-
-
-# ─── Containment measurement ─────────────────────────────────────────────────
-
-
-def _measure_overlap(
-    con: duckdb.DuckDBPyConnection,
-    left_table: str,
-    left_column: str,
-    right_table: str,
-    right_column: str,
-) -> Dict[str, Any]:
-    """
-    Count distinct values on each side and how many they share.
-
-    Both sides are cast to text so an integer key in one file still matches the
-    same key stored as text in another, which is the single most common shape of
-    real-world export data.
-    """
-    sql = f"""
-        WITH l AS (
-            SELECT DISTINCT CAST({q(left_column)} AS VARCHAR) AS v
-            FROM {q(left_table)} WHERE {q(left_column)} IS NOT NULL
-            LIMIT {MAX_DISTINCT_FOR_OVERLAP}
-        ), r AS (
-            SELECT DISTINCT CAST({q(right_column)} AS VARCHAR) AS v
-            FROM {q(right_table)} WHERE {q(right_column)} IS NOT NULL
-            LIMIT {MAX_DISTINCT_FOR_OVERLAP}
-        )
-        SELECT
-            (SELECT count(*) FROM l) AS left_distinct,
-            (SELECT count(*) FROM r) AS right_distinct,
-            (SELECT count(*) FROM l JOIN r ON l.v = r.v) AS shared
-    """
-    row = con.execute(sql).fetchone()
-    left_n, right_n, shared = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
-    return {
-        "left_distinct": left_n,
-        "right_distinct": right_n,
-        "shared": shared,
-        "left_in_right": (shared / left_n) if left_n else 0.0,
-        "right_in_left": (shared / right_n) if right_n else 0.0,
-    }
-
-
-def _cardinality(fk_unique: bool, pk_unique: bool) -> str:
-    """Cardinality written from the foreign key's side, which is how it reads."""
-    if fk_unique and pk_unique:
-        return "one_to_one"
-    if pk_unique and not fk_unique:
-        return "many_to_one"
-    if fk_unique and not pk_unique:
-        return "one_to_many"
-    return "many_to_many"
-
+TEXT_TYPES = {"VARCHAR", "TEXT", "CHAR", "BPCHAR", "STRING"}
 
 CARDINALITY_LABEL = {
     "one_to_one": "1:1",
@@ -315,185 +39,802 @@ CARDINALITY_LABEL = {
 }
 
 
-# ─── Main entry point ────────────────────────────────────────────────────────
+# ─── Name affinity ───────────────────────────────────────────────────────────
 
 
-def detect(project_id: int, tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Find relationships across a project's tables.
+def _tokenise(name: str) -> List[str]:
+    text = re.sub(
+        r"([A-Z]+)([A-Z][a-z])",
+        r"\1_\2",
+        str(name or ""),
+    )
+    text = re.sub(
+        r"([a-z0-9])([A-Z])",
+        r"\1_\2",
+        text,
+    )
+    tokens = re.findall(
+        r"[^\W_]+",
+        text.lower(),
+        re.UNICODE,
+    )
 
-    `tables` needs `id`, `table_name`, `physical_name` and `profile` for each
-    entry. Returns candidates sorted strongest first, each already oriented
-    foreign key -> primary key.
-    """
-    usable = [t for t in tables if (t.get("profile") or {}).get("columns")]
-    if len(usable) < 2:
-        return []
+    result = []
 
-    candidates: List[Dict[str, Any]] = []
+    for token in tokens:
+        if len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif (
+            len(token) > 3
+            and token.endswith("s")
+            and not token.endswith(("ss", "us", "is"))
+        ):
+            token = token[:-1]
 
-    with connect(project_id, read_only=True) as con:
-        present = {t["physical_name"] for t in usable if table_exists(con, t["physical_name"])}
-        usable = [t for t in usable if t["physical_name"] in present]
+        result.append(token)
 
-        for i in range(len(usable)):
-            for j in range(i + 1, len(usable)):
-                left, right = usable[i], usable[j]
-                for left_column in _key_candidates(left):
-                    for right_column in _key_candidates(right):
-                        pre = _worth_testing(left, left_column, right, right_column)
-                        if pre is None:
-                            pre = _worth_testing(right, right_column, left, left_column)
-                            if pre is None:
-                                continue
-                        compatibility, affinity = pre
-
-                        try:
-                            overlap = _measure_overlap(
-                                con,
-                                left["physical_name"], left_column["name"],
-                                right["physical_name"], right_column["name"],
-                            )
-                        except duckdb.Error:
-                            # A pair that will not compare (incompatible casts)
-                            # is simply not a relationship.
-                            continue
-
-                        candidate = _score(
-                            left, left_column, right, right_column, overlap, compatibility, affinity
-                        )
-                        if candidate:
-                            candidates.append(candidate)
-
-    candidates.sort(key=lambda c: -c["confidence"])
-    return _deduplicate(candidates)
+    return result
 
 
-def _score(
+def name_affinity(
+    fk_table: str,
+    fk_column: str,
+    pk_table: str,
+    pk_column: str,
+) -> float:
+    fk_tokens = _tokenise(fk_column)
+    pk_tokens = _tokenise(pk_column)
+
+    if not fk_tokens or not pk_tokens:
+        return 0.0
+
+    fk_core = set(fk_tokens) - KEY_TOKENS
+    pk_core = set(pk_tokens) - KEY_TOKENS
+
+    # Two columns called "id" provide no entity-level evidence.
+    if not fk_core and not pk_core:
+        return 0.15
+
+    if fk_tokens == pk_tokens:
+        return 1.0
+
+    if fk_core and fk_core == pk_core:
+        return 0.95
+
+    # Orders.customer_id -> Customers.id
+    if not pk_core and fk_core:
+        parent = set(_tokenise(pk_table)) - {
+            "dim", "dimension", "table", "tbl",
+        }
+
+        if fk_core & parent:
+            return 0.90 if fk_core <= parent else 0.75
+
+    if not fk_core and pk_core:
+        if pk_core & set(_tokenise(fk_table)):
+            return 0.70
+
+    if fk_core and pk_core and fk_core & pk_core:
+        return round(
+            0.5
+            + 0.3 * len(fk_core & pk_core) / len(fk_core | pk_core),
+            3,
+        )
+
+    return 0.0
+
+
+# ─── Type compatibility ──────────────────────────────────────────────────────
+
+
+def type_compatibility(a_type: str, b_type: str) -> float:
+    a = semantics.base_duck_type(a_type)
+    b = semantics.base_duck_type(b_type)
+
+    supported = (
+        TEXT_TYPES
+        | semantics.NUMERIC_DUCK_TYPES
+        | semantics.TEMPORAL_DUCK_TYPES
+        | {"DECIMAL", "NUMERIC", "UUID", "BOOLEAN"}
+    )
+
+    if a not in supported or b not in supported:
+        return 0.0
+
+    if a == b:
+        return 1.0
+
+    if semantics.is_numeric_type(a) and semantics.is_numeric_type(b):
+        return 0.95
+
+    if semantics.is_temporal_type(a) and semantics.is_temporal_type(b):
+        return 0.90
+
+    if (
+        (a in TEXT_TYPES and b in supported)
+        or (b in TEXT_TYPES and a in supported)
+    ):
+        return 0.70
+
+    return 0.0
+
+
+# ─── Candidate selection ─────────────────────────────────────────────────────
+
+
+def _key_candidates(
+    table: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    return [
+        column
+        for column in (table.get("profile") or {}).get("columns", [])
+        if column.get("semantic_role") not in EXCLUDED_ROLES
+        and not column.get("is_constant")
+        and not column.get("is_empty")
+        and column.get("logical_type") != "boolean"
+        and column.get("subtype") not in {"email", "phone", "url"}
+        and int(column.get("distinct_count") or 0) >= 2
+    ]
+
+
+def domain_distinctiveness(column: Dict[str, Any]) -> float:
+    if column.get("subtype") == "uuid":
+        return 1.0
+
+    logical = column.get("logical_type")
+    stats = column.get("statistics") or {}
+    ndv = int(column.get("distinct_count") or 0)
+
+    if logical in semantics.TEMPORAL_LOGICAL:
+        return 0.2
+
+    if logical == "text":
+        # Numeric strings can be unrelated row counters.
+        if (
+            (column.get("patterns") or {}).get("numeric_ratio", 0)
+            >= 0.9
+        ):
+            return 0.25
+
+        if column.get("semantic_role") != "identifier":
+            return 0.4
+
+        length = float(stats.get("avg_length") or 0)
+        return 0.85 if length >= 6 else 0.5
+
+    if logical in semantics.NUMERIC_LOGICAL:
+        try:
+            lo = float(stats["min"])
+            hi = float(stats["max"])
+            span = hi - lo + 1
+
+            if ndv and 0 < span <= ndv * 1.2:
+                return (
+                    0.1
+                    if lo <= 10 and hi < 100_000
+                    else 0.35
+                )
+
+            if ndv and span > ndv * 50:
+                return 0.8
+
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        return 0.45
+
+    return 0.4
+
+
+def _worth_testing(
     left: Dict[str, Any],
     left_column: Dict[str, Any],
     right: Dict[str, Any],
     right_column: Dict[str, Any],
-    overlap: Dict[str, Any],
-    compatibility: float,
-    affinity: float,
-) -> Optional[Dict[str, Any]]:
-    """Turn one measured pair into a directed, scored relationship candidate."""
-    if overlap["shared"] == 0:
+) -> Optional[Tuple[float, float]]:
+    compatibility = type_compatibility(
+        left_column.get("physical_type", ""),
+        right_column.get("physical_type", ""),
+    )
+
+    if not compatibility:
         return None
 
-    left_unique = bool(left_column.get("is_unique"))
-    right_unique = bool(right_column.get("is_unique"))
-
-    # ── Direction ────────────────────────────────────────────────────────────
-    # The foreign key is the side whose values all appear on the other side.
-    # Uniqueness only breaks ties, because a small child table can look unique
-    # by accident while the parent genuinely is unique by design.
-    if right_unique and not left_unique:
-        fk_is_left = True
-    elif left_unique and not right_unique:
-        fk_is_left = False
-    elif overlap["left_in_right"] > overlap["right_in_left"] + 0.05:
-        fk_is_left = True
-    elif overlap["right_in_left"] > overlap["left_in_right"] + 0.05:
-        fk_is_left = False
-    else:
-        # Equally contained both ways: treat the larger table as the child,
-        # since a lookup table is normally the smaller of the two.
-        fk_is_left = int(left_column.get("row_count") or 0) >= int(right_column.get("row_count") or 0)
-
-    if fk_is_left:
-        fk_table, fk_column, fk_unique = left, left_column, left_unique
-        pk_table, pk_column, pk_unique = right, right_column, right_unique
-        containment = overlap["left_in_right"]
-        orphan_ratio = 1.0 - overlap["left_in_right"]
-    else:
-        fk_table, fk_column, fk_unique = right, right_column, right_unique
-        pk_table, pk_column, pk_unique = left, left_column, left_unique
-        containment = overlap["right_in_left"]
-        orphan_ratio = 1.0 - overlap["right_in_left"]
-
-    directed_affinity = name_affinity(
-        fk_table["table_name"], fk_column["name"], pk_table["table_name"], pk_column["name"]
+    affinity = max(
+        name_affinity(
+            left["table_name"],
+            left_column["name"],
+            right["table_name"],
+            right_column["name"],
+        ),
+        name_affinity(
+            right["table_name"],
+            right_column["name"],
+            left["table_name"],
+            left_column["name"],
+        ),
     )
-    affinity = max(affinity, directed_affinity)
 
-    uniqueness_score = 1.0 if pk_unique else (0.4 if float(pk_column.get("unique_ratio") or 0) > 0.9 else 0.1)
-    distinctiveness = max(domain_distinctiveness(fk_column), domain_distinctiveness(pk_column))
-
-    # Values alone are not enough when the values are unremarkable. A perfect
-    # overlap between two columns of small sequential integers with unrelated
-    # names is a coincidence, and reporting it as a relationship sends the user
-    # off to build a data model on sand.
-    if affinity < 0.5 and distinctiveness < 0.6:
-        return None
-
-    confidence = (
-        0.45 * containment
-        + 0.25 * uniqueness_score
-        + 0.20 * affinity
-        + 0.10 * compatibility
+    distinctive = min(
+        domain_distinctiveness(left_column),
+        domain_distinctiveness(right_column),
     )
-    # Weak names plus unremarkable values means the evidence is thin however
-    # cleanly the numbers line up, and the score should say so.
-    if affinity < 0.5:
-        confidence *= 0.6 + 0.4 * distinctiveness
 
-    confidence = round(min(confidence, 0.99), 3)
-    if confidence < SUGGEST_THRESHOLD:
-        return None
+    if affinity >= 0.5 or distinctive >= 0.8:
+        return compatibility, affinity
 
-    cardinality = _cardinality(fk_unique, pk_unique)
+    return None
 
-    notes: List[str] = []
-    if orphan_ratio > 0.001:
-        missing = round(orphan_ratio * 100, 1)
-        notes.append(
-            f"{missing}% of {fk_table['table_name']}.{fk_column['name']} values have no match in "
-            f"{pk_table['table_name']}. Those rows disappear from an inner join."
-        )
-    if not pk_unique:
-        notes.append(
-            f"{pk_table['table_name']}.{pk_column['name']} is not unique, so joining on it multiplies rows "
-            f"and will overstate any total."
-        )
-    if compatibility < 0.95:
-        notes.append(
-            f"The two columns are stored as different types "
-            f"({fk_column.get('physical_type')} and {pk_column.get('physical_type')}), so the join casts both to text."
-        )
 
-    auto = (
-        containment >= AUTO_APPROVE_CONTAINMENT
-        and pk_unique
-        and affinity >= 0.8
-        and confidence >= AUTO_APPROVE_SCORE
+# ─── Exact measurements ──────────────────────────────────────────────────────
+
+
+def _measure_overlap(
+    con,
+    left_table: str,
+    left_column: str,
+    right_table: str,
+    right_column: str,
+) -> Dict[str, Any]:
+    """
+    Measure complete domains without truncation.
+
+    Match the existing query engine: native equality for equal base types,
+    otherwise text equality. Leading zeros and case are not normalised.
+    Null/blank keys are excluded from coverage.
+    """
+    left_schema = {
+        column["name"]: column["type"]
+        for column in describe(con, left_table)
+    }
+    right_schema = {
+        column["name"]: column["type"]
+        for column in describe(con, right_table)
+    }
+
+    same = (
+        semantics.base_duck_type(left_schema[left_column])
+        == semantics.base_duck_type(right_schema[right_column])
     )
+
+    left_expr = q(left_column)
+    right_expr = q(right_column)
+
+    if not same:
+        left_expr = f"CAST({left_expr} AS VARCHAR)"
+        right_expr = f"CAST({right_expr} AS VARCHAR)"
+
+    whitespace = "' \t\r\n\f\v\u00a0'"
+    valid = f"trim(CAST(v AS VARCHAR), {whitespace}) <> ''"
+
+    row = con.execute(
+        f"""
+        WITH l AS (
+            SELECT {left_expr} AS v, count(*) AS n
+            FROM {q(left_table)}
+            WHERE {q(left_column)} IS NOT NULL
+            GROUP BY 1
+        ), r AS (
+            SELECT {right_expr} AS v, count(*) AS n
+            FROM {q(right_table)}
+            WHERE {q(right_column)} IS NOT NULL
+            GROUP BY 1
+        ), lv AS (
+            SELECT * FROM l WHERE {valid}
+        ), rv AS (
+            SELECT * FROM r WHERE {valid}
+        ), matched AS (
+            SELECT lv.n AS ln, rv.n AS rn
+            FROM lv
+            JOIN rv ON lv.v = rv.v
+        )
+        SELECT
+            (SELECT count(*) FROM lv),
+            (SELECT count(*) FROM rv),
+            (SELECT count(*) FROM matched),
+            (SELECT coalesce(sum(n), 0) FROM lv),
+            (SELECT coalesce(sum(n), 0) FROM rv),
+            (SELECT coalesce(sum(ln), 0) FROM matched),
+            (SELECT coalesce(sum(rn), 0) FROM matched),
+            (SELECT count(*) FROM {q(left_table)}),
+            (SELECT count(*) FROM {q(right_table)}),
+            (SELECT coalesce(max(n), 0) FROM l),
+            (SELECT coalesce(max(n), 0) FROM r)
+        """
+    ).fetchone()
+
+    (
+        left_distinct,
+        right_distinct,
+        shared,
+        left_rows,
+        right_rows,
+        left_matched,
+        right_matched,
+        left_total,
+        right_total,
+        left_max_count,
+        right_max_count,
+    ) = map(int, row)
 
     return {
+        "left_distinct": left_distinct,
+        "right_distinct": right_distinct,
+        "shared": shared,
+        "left_in_right": (
+            shared / left_distinct if left_distinct else 0.0
+        ),
+        "right_in_left": (
+            shared / right_distinct if right_distinct else 0.0
+        ),
+        "left_rows": left_rows,
+        "right_rows": right_rows,
+        "left_matched_rows": left_matched,
+        "right_matched_rows": right_matched,
+        "left_total": left_total,
+        "right_total": right_total,
+        "left_missing": left_total - left_rows,
+        "right_missing": right_total - right_rows,
+        "left_unique": bool(
+            left_distinct and left_max_count == 1
+        ),
+        "right_unique": bool(
+            right_distinct and right_max_count == 1
+        ),
+        "exact": True,
+    }
+
+
+def _cardinality(fk_unique: bool, pk_unique: bool) -> str:
+    if fk_unique and pk_unique:
+        return "one_to_one"
+    if pk_unique:
+        return "many_to_one"
+    if fk_unique:
+        return "one_to_many"
+    return "many_to_many"
+
+
+# ─── Evidence and scoring ────────────────────────────────────────────────────
+
+
+def _describe_pair(
+    fk_table,
+    fk_column,
+    pk_table,
+    pk_column,
+    overlap,
+    fk_left=True,
+) -> Dict[str, Any]:
+    fk, pk = (
+        ("left", "right")
+        if fk_left
+        else ("right", "left")
+    )
+
+    coverage = overlap[f"{fk}_in_{pk}"]
+    distinct = overlap[f"{fk}_distinct"]
+    rows = overlap[f"{fk}_rows"]
+    matched_rows = overlap[f"{fk}_matched_rows"]
+    pk_unique = overlap[f"{pk}_unique"]
+
+    affinity = name_affinity(
+        fk_table["table_name"],
+        fk_column["name"],
+        pk_table["table_name"],
+        pk_column["name"],
+    )
+    compatibility = type_compatibility(
+        fk_column.get("physical_type", ""),
+        pk_column.get("physical_type", ""),
+    )
+
+    confidence = min(
+        0.99,
+        0.45 * coverage
+        + 0.25 * (1.0 if pk_unique else 0.1)
+        + 0.20 * affinity
+        + 0.10 * compatibility,
+    )
+
+    notes = []
+    unmatched = distinct - overlap["shared"]
+
+    if unmatched:
+        notes.append(
+            f"{unmatched:,} distinct nonblank child keys have "
+            f"no match, affecting {rows - matched_rows:,} rows. "
+            "A left join retains them with missing parent fields."
+        )
+
+    if overlap[f"{fk}_missing"]:
+        notes.append(
+            f"{overlap[f'{fk}_missing']:,} child rows have null "
+            "or blank keys; these are excluded from key coverage."
+        )
+
+    if overlap[f"{pk}_missing"]:
+        notes.append(
+            f"{overlap[f'{pk}_missing']:,} parent rows have null "
+            "or blank keys; clean these before treating the column "
+            "as a primary key."
+        )
+
+    if not pk_unique:
+        notes.append(
+            "The parent column contains repeated non-null keys. "
+            "Matching repeated keys can multiply rows and inflate "
+            "aggregates."
+        )
+
+    if compatibility < 1:
+        notes.append(
+            "Physical types differ. The current query engine "
+            "compares these keys as text; leading zeros, decimal "
+            "formatting and case are not normalised."
+        )
+
+    if not overlap["shared"]:
+        notes.append(
+            "No nonblank keys match. An inner join yields no "
+            "matching rows; a left join retains child rows with "
+            "missing parent fields."
+        )
+
+    return {
+        "cardinality": _cardinality(
+            overlap[f"{fk}_unique"],
+            pk_unique,
+        ),
+        "confidence": round(confidence, 3),
+        "coverage": round(coverage, 4),
+        "orphan_ratio": round(1 - coverage, 4),
+        "row_coverage": (
+            round(matched_rows / rows, 4) if rows else 0.0
+        ),
+        "matched_values": overlap["shared"],
+        "matched_rows": matched_rows,
+        "name_affinity": affinity,
+        "type_compatibility": compatibility,
+        "measurement_exact": True,
+        "notes": notes,
+        "evidence": (
+            f"{overlap['shared']:,} of {distinct:,} distinct "
+            f"nonblank keys ({coverage:.1%}) in "
+            f"{fk_table['table_name']}.{fk_column['name']} match "
+            f"{pk_table['table_name']}.{pk_column['name']}; "
+            f"{matched_rows:,} of {rows:,} nonblank child rows "
+            "match. Counts are exact."
+        ),
+    }
+
+
+def _score(
+    left,
+    left_column,
+    right,
+    right_column,
+    overlap,
+    compatibility,
+    affinity,
+) -> Optional[Dict[str, Any]]:
+    if not overlap["shared"]:
+        return None
+
+    left_unique = overlap["left_unique"]
+    right_unique = overlap["right_unique"]
+
+    forward = name_affinity(
+        left["table_name"],
+        left_column["name"],
+        right["table_name"],
+        right_column["name"],
+    )
+    reverse = name_affinity(
+        right["table_name"],
+        right_column["name"],
+        left["table_name"],
+        left_column["name"],
+    )
+
+    ambiguous = False
+
+    if left_unique != right_unique:
+        fk_left = right_unique
+
+    elif abs(forward - reverse) >= 0.15:
+        fk_left = forward > reverse
+
+    elif (
+        abs(
+            overlap["left_in_right"]
+            - overlap["right_in_left"]
+        ) > 0.05
+    ):
+        fk_left = (
+            overlap["left_in_right"]
+            > overlap["right_in_left"]
+        )
+
+    else:
+        fk_left = (
+            overlap["left_total"]
+            >= overlap["right_total"]
+        )
+        ambiguous = True
+
+    if fk_left:
+        fk_table, fk_column = left, left_column
+        pk_table, pk_column = right, right_column
+        parent = "right"
+        child = "left"
+    else:
+        fk_table, fk_column = right, right_column
+        pk_table, pk_column = left, left_column
+        parent = "left"
+        child = "right"
+
+    result = _describe_pair(
+        fk_table,
+        fk_column,
+        pk_table,
+        pk_column,
+        overlap,
+        fk_left,
+    )
+
+    if result["confidence"] < SUGGEST_THRESHOLD:
+        return None
+
+    # Approval uses exact counts, not rounded display percentages.
+    auto = (
+        overlap["shared"] == overlap[f"{child}_distinct"]
+        and overlap["shared"] >= MIN_AUTO_SHARED_VALUES
+        and overlap[f"{parent}_unique"]
+        and overlap[f"{parent}_missing"] == 0
+        and result["name_affinity"] >= 0.8
+        and result["confidence"] >= AUTO_APPROVE_SCORE
+        and compatibility >= 0.95
+        and fk_column.get("semantic_role") == "identifier"
+        and pk_column.get("semantic_role") == "identifier"
+        and not ambiguous
+    )
+
+    if ambiguous:
+        result["notes"].append(
+            "Both directions are plausible. The displayed "
+            "direction is provisional; confirm the business "
+            "relationship."
+        )
+
+    result.update({
         "from_table_id": fk_table["id"],
         "from_table_name": fk_table["table_name"],
         "from_column": fk_column["name"],
         "to_table_id": pk_table["id"],
         "to_table_name": pk_table["table_name"],
         "to_column": pk_column["name"],
-        "cardinality": cardinality,
-        "cardinality_label": CARDINALITY_LABEL[cardinality],
-        "confidence": confidence,
+        "cardinality_label": CARDINALITY_LABEL[
+            result["cardinality"]
+        ],
         "status": "approved" if auto else "suggested",
         "auto_approved": auto,
-        "coverage": round(containment, 4),
-        "orphan_ratio": round(orphan_ratio, 4),
-        "matched_values": overlap["shared"],
-        "name_affinity": round(affinity, 3),
-        "type_compatibility": round(compatibility, 3),
-        "notes": notes,
-        "evidence": (
-            f"{round(containment * 100, 1)}% of the {overlap['shared']:,} distinct "
-            f"{fk_column['name']} values in {fk_table['table_name']} are present in "
-            f"{pk_table['table_name']}.{pk_column['name']}."
-        ),
-    }
+    })
+
+    return result
+
+
+# ─── Competing links and paths ────────────────────────────────────────────────
+
+
+def _deduplicate(
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove identical links while retaining alternative parent choices."""
+    result = []
+    seen = set()
+
+    for candidate in candidates:
+        pair = frozenset((
+            (
+                candidate["from_table_id"],
+                candidate["from_column"],
+            ),
+            (
+                candidate["to_table_id"],
+                candidate["to_column"],
+            ),
+        ))
+
+        if pair not in seen:
+            seen.add(pair)
+            result.append(candidate)
+
+    return result
+
+
+def _resolve_ambiguity(
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    def suggest(candidate, reason):
+        candidate["status"] = "suggested"
+        candidate["auto_approved"] = False
+        candidate["notes"].append(reason)
+
+    by_child = {}
+    by_pair = {}
+
+    for candidate in candidates:
+        child_key = (
+            candidate["from_table_id"],
+            candidate["from_column"],
+        )
+        table_pair = frozenset((
+            candidate["from_table_id"],
+            candidate["to_table_id"],
+        ))
+
+        by_child.setdefault(child_key, []).append(candidate)
+        by_pair.setdefault(table_pair, []).append(candidate)
+
+    for group in by_child.values():
+        best = max(candidate["confidence"] for candidate in group)
+        rivals = [
+            candidate
+            for candidate in group
+            if candidate["confidence"] >= best - 0.08
+        ]
+
+        if len(rivals) > 1:
+            for candidate in rivals:
+                suggest(
+                    candidate,
+                    "This child key has competing parent candidates; "
+                    "select the intended parent.",
+                )
+
+    for group in by_pair.values():
+        approved = [
+            candidate
+            for candidate in group
+            if candidate["auto_approved"]
+        ]
+
+        if len(approved) > 1:
+            for candidate in approved:
+                suggest(
+                    candidate,
+                    "Multiple links connect these tables; choose "
+                    "which relationship should be used for queries.",
+                )
+
+    # Avoid cycles among newly auto-approved candidates.
+    # Existing stored links also need API/query-layer validation.
+    roots = {}
+
+    def root(node):
+        roots.setdefault(node, node)
+
+        while roots[node] != node:
+            node = roots[node]
+
+        return node
+
+    for candidate in candidates:
+        if not candidate["auto_approved"]:
+            continue
+
+        left_root = root(candidate["from_table_id"])
+        right_root = root(candidate["to_table_id"])
+
+        if left_root == right_root:
+            suggest(
+                candidate,
+                "This link would create another path in the "
+                "detected model; review it before activation.",
+            )
+        else:
+            roots[left_root] = right_root
+
+    return candidates
+
+
+# ─── Automatic detection ─────────────────────────────────────────────────────
+
+
+def detect(
+    project_id: int,
+    tables: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    usable = sorted(
+        [
+            table
+            for table in tables
+            if (table.get("profile") or {}).get("columns")
+        ],
+        key=lambda table: table["id"],
+    )
+
+    if len(usable) < 2:
+        return []
+
+    candidates = []
+
+    with connect(project_id, read_only=True) as con:
+        usable = [
+            table
+            for table in usable
+            if table_exists(con, table["physical_name"])
+        ]
+
+        choices = {}
+
+        for table in usable:
+            schema = {
+                column["name"]: column["type"]
+                for column in describe(con, table["physical_name"])
+            }
+
+            # Use current types and ignore removed columns.
+            choices[table["id"]] = [
+                dict(
+                    column,
+                    physical_type=schema[column["name"]],
+                )
+                for column in _key_candidates(table)
+                if column["name"] in schema
+            ]
+
+        for index, left in enumerate(usable):
+            for right in usable[index + 1:]:
+                for left_column in choices[left["id"]]:
+                    for right_column in choices[right["id"]]:
+                        pre = _worth_testing(
+                            left,
+                            left_column,
+                            right,
+                            right_column,
+                        )
+
+                        if pre is None:
+                            continue
+
+                        # A resource/SQL failure should be reported,
+                        # not silently presented as "no relationships".
+                        overlap = _measure_overlap(
+                            con,
+                            left["physical_name"],
+                            left_column["name"],
+                            right["physical_name"],
+                            right_column["name"],
+                        )
+
+                        candidate = _score(
+                            left,
+                            left_column,
+                            right,
+                            right_column,
+                            overlap,
+                            *pre,
+                        )
+
+                        if candidate:
+                            candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda candidate: (
+            -candidate["confidence"],
+            candidate["from_table_id"],
+            candidate["from_column"],
+            candidate["to_table_id"],
+            candidate["to_column"],
+        )
+    )
+
+    return _resolve_ambiguity(_deduplicate(candidates))
+
+
+# ─── Manual relationships ────────────────────────────────────────────────────
 
 
 def measure_pair(
@@ -503,98 +844,50 @@ def measure_pair(
     pk_table: Dict[str, Any],
     pk_column: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Measure a relationship the user defined by hand.
-
-    Their choice of direction is respected, but the values are still checked so
-    they are told straight away if the columns do not line up. A manual link
-    that quietly matches nothing is worse than no link at all.
-    """
-    def find(table: Dict[str, Any], column: str) -> Optional[Dict[str, Any]]:
-        for candidate in ((table.get("profile") or {}).get("columns") or []):
-            if candidate["name"] == column:
-                return candidate
-        return None
-
-    fk_profile, pk_profile = find(fk_table, fk_column), find(pk_table, pk_column)
-    if not fk_profile or not pk_profile:
-        return None
-
+    """Measure a manual link in the direction selected by the user."""
     with connect(project_id, read_only=True) as con:
+        for table, column_name in (
+            (fk_table, fk_column),
+            (pk_table, pk_column),
+        ):
+            if not table_exists(con, table["physical_name"]):
+                return None
+
+            names = {
+                column["name"]
+                for column in describe(con, table["physical_name"])
+            }
+
+            if column_name not in names:
+                return None
+
+        left_schema = {
+            column["name"]: column["type"]
+            for column in describe(con, fk_table["physical_name"])
+        }
+        right_schema = {
+            column["name"]: column["type"]
+            for column in describe(con, pk_table["physical_name"])
+        }
+
         overlap = _measure_overlap(
-            con, fk_table["physical_name"], fk_column, pk_table["physical_name"], pk_column
+            con,
+            fk_table["physical_name"],
+            fk_column,
+            pk_table["physical_name"],
+            pk_column,
         )
 
-    containment = overlap["left_in_right"]
-    pk_unique = bool(pk_profile.get("is_unique"))
-    fk_unique = bool(fk_profile.get("is_unique"))
-    compatibility = type_compatibility(
-        fk_profile.get("physical_type", ""), pk_profile.get("physical_type", "")
+    return _describe_pair(
+        fk_table,
+        {
+            "name": fk_column,
+            "physical_type": left_schema[fk_column],
+        },
+        pk_table,
+        {
+            "name": pk_column,
+            "physical_type": right_schema[pk_column],
+        },
+        overlap,
     )
-    affinity = name_affinity(fk_table["table_name"], fk_column, pk_table["table_name"], pk_column)
-
-    notes: List[str] = []
-    if overlap["shared"] == 0:
-        notes.append(
-            f"None of the values in {fk_table['table_name']}.{fk_column} appear in "
-            f"{pk_table['table_name']}.{pk_column}. This join will return nothing."
-        )
-    elif containment < 0.999:
-        notes.append(
-            f"{round((1 - containment) * 100, 1)}% of {fk_table['table_name']}.{fk_column} values "
-            f"have no match in {pk_table['table_name']}."
-        )
-    if not pk_unique:
-        notes.append(
-            f"{pk_table['table_name']}.{pk_column} is not unique, so this join multiplies rows "
-            f"and will overstate any total built on it."
-        )
-    if compatibility < 0.95:
-        notes.append(
-            f"The columns are stored as different types "
-            f"({fk_profile.get('physical_type')} and {pk_profile.get('physical_type')}), so the join compares them as text."
-        )
-
-    confidence = round(
-        min(0.45 * containment + 0.25 * (1.0 if pk_unique else 0.1) + 0.20 * affinity + 0.10 * compatibility, 0.99),
-        3,
-    )
-
-    return {
-        "cardinality": _cardinality(fk_unique, pk_unique),
-        "confidence": confidence,
-        "coverage": round(containment, 4),
-        "notes": notes,
-        "evidence": (
-            f"{round(containment * 100, 1)}% of the distinct {fk_column} values in "
-            f"{fk_table['table_name']} are present in {pk_table['table_name']}.{pk_column}."
-        ),
-    }
-
-
-def _deduplicate(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep the best relationship per table pair per column.
-
-    A column should join to one parent, not three. Candidates arrive sorted by
-    confidence, so the first sighting of each key wins.
-    """
-    seen_pairs: set = set()
-    seen_fk: set = set()
-    result: List[Dict[str, Any]] = []
-
-    for candidate in candidates:
-        pair = frozenset(
-            [
-                (candidate["from_table_id"], candidate["from_column"]),
-                (candidate["to_table_id"], candidate["to_column"]),
-            ]
-        )
-        fk_identity = (candidate["from_table_id"], candidate["from_column"], candidate["to_table_id"])
-        if pair in seen_pairs or fk_identity in seen_fk:
-            continue
-        seen_pairs.add(pair)
-        seen_fk.add(fk_identity)
-        result.append(candidate)
-
-    return result

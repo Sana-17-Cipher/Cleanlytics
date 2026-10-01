@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ArrowRight, Check, Database, Layers, Link2, Loader2, Play, Sparkles, TriangleAlert, X,
 } from 'lucide-react';
@@ -335,15 +336,62 @@ function QueryPreview({
 }: { preview: { suggestion: AnalysisSuggestion; result: QueryResult }; onClose: () => void }) {
   const { suggestion, result } = preview;
   const [showSql, setShowSql] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const columns = result.fields.map((field) => field.key);
 
-  return (
-    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6" onClick={onClose}>
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    dialogRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      }
+      if (event.key === 'Tab') {
+        const buttons = dialogRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)');
+        if (!buttons?.length) {
+          event.preventDefault();
+          return;
+        }
+        const first = buttons[0];
+        const last = buttons[buttons.length - 1];
+        if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialogRef.current)) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [onClose]);
+
+  if (typeof document === 'undefined') return null;
+
+  // Escape the animated model container: its retained transform traps fixed children.
+  return createPortal(
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3 sm:p-6"
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div
-        className="glass-panel rounded-xl border border-gray-800 max-w-3xl w-full max-h-[80vh] flex flex-col"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={suggestion.title}
+        tabIndex={-1}
+        className="rounded-xl border border-gray-700 bg-[#0b1220] shadow-2xl max-w-3xl w-full max-h-[85dvh] min-h-0 overflow-hidden flex flex-col outline-none"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="px-5 py-4 border-b border-gray-800 flex items-start justify-between gap-4">
+        <div className="shrink-0 px-5 py-4 border-b border-gray-800 flex items-start justify-between gap-4">
           <div className="min-w-0">
             <h3 className="text-sm font-bold text-white">{suggestion.title}</h3>
             <p className="text-[11px] text-gray-500 mt-0.5">
@@ -353,13 +401,13 @@ function QueryPreview({
               {result.truncated && ' (showing the first page)'}
             </p>
           </div>
-          <button onClick={onClose} className="text-gray-500 hover:text-white shrink-0">
+          <button type="button" aria-label="Close analysis preview" onClick={onClose} className="text-gray-400 hover:text-white shrink-0">
             <X className="h-4 w-4" />
           </button>
         </div>
 
         {result.warnings.length > 0 && (
-          <div className="px-5 py-3 border-b border-gray-800 space-y-1">
+          <div className="shrink-0 max-h-24 overflow-auto px-5 py-3 border-b border-gray-800 space-y-1">
             {result.warnings.map((warning) => (
               <p key={warning} className="text-[11px] text-amber-400 flex items-start gap-1.5">
                 <TriangleAlert className="h-3.5 w-3.5 shrink-0 mt-0.5" /> {warning}
@@ -368,7 +416,8 @@ function QueryPreview({
           </div>
         )}
 
-        <div className="flex-1 overflow-auto">
+        <div className="min-h-0 flex-1 overflow-auto">
+          {result.rows.length === 0 && <p className="p-5 text-sm text-gray-400">No rows match this analysis.</p>}
           <table className="w-full text-left text-xs">
             <thead className="sticky top-0 bg-zinc-900/95 backdrop-blur">
               <tr className="border-b border-gray-800">
@@ -402,7 +451,7 @@ function QueryPreview({
           </table>
         </div>
 
-        <div className="px-5 py-3 border-t border-gray-800">
+        <div className="shrink-0 px-5 py-3 border-t border-gray-800">
           <button
             onClick={() => setShowSql(!showSql)}
             className="text-[11px] text-gray-500 hover:text-gray-300"
@@ -410,12 +459,13 @@ function QueryPreview({
             {showSql ? 'Hide' : 'Show'} the query behind these numbers
           </button>
           {showSql && (
-            <pre className="mt-2 text-[10px] text-gray-400 font-mono bg-zinc-950/60 border border-gray-800 rounded-lg p-3 overflow-x-auto">
+            <pre className="mt-2 max-h-40 text-[10px] text-gray-400 font-mono bg-zinc-950/60 border border-gray-800 rounded-lg p-3 overflow-auto">
               {result.sql}
             </pre>
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
